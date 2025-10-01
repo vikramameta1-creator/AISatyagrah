@@ -1,0 +1,6 @@
+﻿body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111}
+.masthead{font-size:44px;font-weight:700;letter-spacing:.5px;margin:12px 16px}
+.grid{display:grid;grid-template-columns:1.6fr 1fr;gap:20px;padding:16px}
+.card{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:6px}
+.hero{height:520px;display:flex;align-items:center;justify-content:center;border:1px dashed #ccc}
+.foot{font-size:12px;color:#666;margin:12px 16px}

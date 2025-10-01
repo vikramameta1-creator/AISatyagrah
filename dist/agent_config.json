@@ -1,0 +1,7 @@
+{
+  "sd_host": "http://127.0.0.1:7860",
+  "max_per_day": 5,
+  "share_percent": 50,
+  "paused": false,
+  "inactivity_minutes": 120
+}

@@ -1,0 +1,12 @@
+﻿project:
+  name: AI Satyagrah
+image:
+  default_style: rk_lineart
+  width: 1024
+  height: 1280
+  steps: 34
+  cfg: 6.5
+  sampler: DPM++ 2M Karras
+  seed: 3117
+risk:
+  force_generic_judge: true

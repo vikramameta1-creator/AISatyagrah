@@ -1,0 +1,5 @@
+=== PeerAgent crash ===
+Traceback (most recent call last):
+  File "agent_app.py", line 91, in <module>
+  File "agent_app.py", line 73, in main
+ImportError: cannot import name 'agent' from 'satyagrah.peer' (C:\Users\Vikram\AppData\Local\Temp\_MEI186082\satyagrah\peer\__init__.py)

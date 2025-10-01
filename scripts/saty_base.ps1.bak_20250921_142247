@@ -1,0 +1,123 @@
+﻿param(
+  [int]$Top = 3,
+  [int]$Seed = 12345,
+  [string]$Date = "latest",
+  [string]$Langs = "en,hi",
+  [string[]]$Platforms = @("instagram","instagram-stories","x","shorts","youtube","whatsapp","telegram")
+)
+
+function Write-Step($msg){ Write-Host ("`n=== " + $msg + " ===") -ForegroundColor Cyan }
+
+function Resolve-Root {
+  param([string]$Default="D:\AISatyagrah")
+  if ($env:SATY_ROOT -and (Test-Path $env:SATY_ROOT)) { return (Resolve-Path $env:SATY_ROOT).Path }
+  if ($PSCommandPath) {
+    $here = Split-Path -Parent $PSCommandPath
+    foreach ($p in @($here, (Split-Path $here -Parent), (Split-Path $here -Parent))) {
+      if ($p -and (Test-Path (Join-Path $p "satyagrah"))) { return (Resolve-Path $p).Path }
+    }
+  }
+  if (Test-Path $Default) { return (Resolve-Path $Default).Path }
+  return (Get-Location).Path
+}
+
+function SD-Alive([string]$base="http://127.0.0.1:7860"){
+  try { (Invoke-WebRequest -UseBasicParsing -Uri $base -Method Get -TimeoutSec 2).StatusCode -ge 200 } catch { $false }
+}
+
+function Resolve-RunDate {
+  param([string]$DateParam, [string]$Root)
+  if ($DateParam -and $DateParam -ne "latest") { return $DateParam }
+  $exports = Join-Path $Root "exports"
+  if (Test-Path $exports) {
+    $dirs = Get-ChildItem -Path $exports -Directory |
+      Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' } |
+      Sort-Object Name -Descending
+    if ($dirs) { return $dirs[0].Name }
+  }
+  return (Get-Date -Format 'yyyy-MM-dd')
+}
+
+$ErrorActionPreference = "Stop"
+$root = Resolve-Root
+Write-Host ("Root: " + $root) -ForegroundColor DarkGray
+
+Push-Location $root
+try {
+  Write-Step "Doctor"
+  python -m satyagrah doctor --strict
+
+  Write-Step "Research"
+  python -m satyagrah research --date $Date
+
+  Write-Step "Triage"
+  python -m satyagrah triage --date $Date
+
+  $skip = -not (SD-Alive)
+  if ($skip) { Write-Host "[info] SD API not reachable -> --skip_image will be set." -ForegroundColor Yellow }
+
+  Write-Step "Batch quick ($Top items)"
+  $quickArgs = @("batch","--date",$Date,"--seed",$Seed,"--top",$Top,"--lang",$Langs,"--saveas")
+  if ($skip) { $quickArgs += "--skip_image" }
+  python -m satyagrah @quickArgs
+
+  $aspectMap = @{
+    instagram           = "1x1"
+    "instagram-stories" = "9x16"
+    x                   = "4x5"
+    shorts              = "9x16"
+    youtube             = "1x1"
+    whatsapp            = "1x1"
+    telegram            = "1x1"
+  }
+
+  for ($i=1; $i -le $Top; $i++) {
+    $tid = "t$($i)"
+    Write-Step "Publish $tid"
+    $csvOnce = $true
+    foreach ($p in $Platforms) {
+      $aspect = $aspectMap[$p]
+      if (-not $aspect) { continue }
+      $args = @("publish","--date",$Date,"--id",$tid,"--image",$aspect,"--platform",$p,"--lang",$Langs)
+      if ($csvOnce) { $args += "--csv"; $csvOnce = $false }
+      python -m satyagrah @args
+    }
+  }
+
+  $runDate = Resolve-RunDate -DateParam $Date -Root $root
+  $outbox  = Join-Path (Join-Path $root "exports") (Join-Path $runDate "outbox")
+  if (Test-Path $outbox) {
+    $zip = Join-Path (Join-Path $root "exports") (Join-Path $runDate ("outbox_" + $runDate + ".zip"))
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    Compress-Archive -Path (Join-Path $outbox "*") -DestinationPath $zip -Force
+    Write-Host ("ZIP -> " + $zip) -ForegroundColor Green
+  } else {
+    Write-Host ("[warn] Outbox not found for date " + $runDate) -ForegroundColor Yellow
+  }
+
+  python -m satyagrah open --what exports --date $Date
+  Write-Host "`nAll done." -ForegroundColor Green
+}
+finally { Pop-Location }
+function Open-SatyOutboxLatest {
+  param(
+    [string]$Root = $(if ($env:SATY_ROOT) { $env:SATY_ROOT } elseif ($PSScriptRoot) { (Resolve-Path (Join-Path $PSScriptRoot "..")).Path } else { (Get-Location).Path })
+  )
+  $exports = Join-Path $Root "exports"
+
+  $latestDate = Get-ChildItem -Path $exports -Directory |
+    Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' } |
+    Sort-Object Name -Descending |
+    ForEach-Object {
+      $ob = Join-Path $_.FullName "outbox"
+      if (Test-Path $ob) { $_.Name }
+    } | Select-Object -First 1
+
+  if ($latestDate) {
+    Write-Host "Opening latest outbox => $latestDate"
+    python -m satyagrah open --what exports --date $latestDate
+  } else {
+    Write-Warning "No dated outbox with files found under $exports"
+  }
+}
+

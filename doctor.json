@@ -1,0 +1,87 @@
+﻿[
+  {
+    "name": "Python",
+    "info": "3.11.9",
+    "ok": true
+  },
+  {
+    "name": "import jinja2",
+    "info": "ok",
+    "ok": true
+  },
+  {
+    "name": "import PIL",
+    "info": "ok",
+    "ok": true
+  },
+  {
+    "name": "import playwright.sync_api",
+    "info": "ok",
+    "ok": true
+  },
+  {
+    "name": "import yaml",
+    "info": "ok",
+    "ok": true
+  },
+  {
+    "name": "import requests",
+    "info": "ok",
+    "ok": true
+  },
+  {
+    "name": "Disk D: free (GB)",
+    "info": "488.0",
+    "ok": true
+  },
+  {
+    "name": "dir D:\\AISatyagrah\\data",
+    "info": "exists",
+    "ok": true
+  },
+  {
+    "name": "dir D:\\AISatyagrah\\exports",
+    "info": "exists",
+    "ok": true
+  },
+  {
+    "name": "dir D:\\AISatyagrah\\configs",
+    "info": "exists",
+    "ok": true
+  },
+  {
+    "name": "configs/settings.yaml",
+    "info": "loaded",
+    "ok": true
+  },
+  {
+    "name": "configs/feeds.yaml",
+    "info": "loaded",
+    "ok": true
+  },
+  {
+    "name": "template onepager_smoke.html.j2",
+    "info": "ok",
+    "ok": true
+  },
+  {
+    "name": "template styles.css",
+    "info": "ok",
+    "ok": true
+  },
+  {
+    "name": "SD API http://127.0.0.1:7860",
+    "info": "reachable",
+    "ok": true
+  },
+  {
+    "name": "wrong-root artifacts",
+    "info": "none",
+    "ok": true
+  },
+  {
+    "name": "write permissions",
+    "info": "ok",
+    "ok": true
+  }
+]

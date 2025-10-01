@@ -1,0 +1,1009 @@
+﻿# -*- coding: utf-8 -*-
+import argparse
+import json
+import pathlib
+import datetime
+import shutil
+import csv
+import os
+import sys
+from typing import List
+
+from .layout import render_smoke, render_onepager
+from .image import build_prompt, generate_image_for_id
+from .nlp.facts import write_facts_stub, read_facts
+from .nlp.captions import build_caption, write_caption
+from .nlp.hashtags import make_hashtags
+from .nlp.angle import angle_from_title
+from .config import load_feeds_yaml, load_settings
+from .ingest.rss import fetch_from_feeds, write_topics
+from .triage import shortlist
+from .utils import make_postpack
+from .utils.idmap import ensure_friendly_id, resolve_topic_id
+from .utils.thumbs import make_thumbs
+from .doctor import run as doctor_run
+
+# Optional helpers
+try:
+    from .utils.dates import latest_run_date
+except Exception:
+    def latest_run_date():
+        return None
+
+try:
+    from .image.health import sdapi_ping
+except Exception:
+    def sdapi_ping(_host: str) -> bool:
+        return True
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+# ------------------ helpers ------------------
+
+def _resolve_date(d):
+    if d and str(d).lower() == "latest":
+        return latest_run_date() or datetime.date.today().isoformat()
+    return d or datetime.date.today().isoformat()
+
+def _settings_defaults():
+    return (load_settings() or {}).get("defaults", {})
+
+def _resolve_defaults(args):
+    s = _settings_defaults()
+    host = args.host if getattr(args, "host", None) else s.get("host", "http://127.0.0.1:7860")
+    aspect = args.aspect if getattr(args, "aspect", None) else s.get("aspect", "4x5")
+    watermark = args.watermark if getattr(args, "watermark", None) is not None else s.get("watermark", "off")
+    wm_text = args.wm_text if getattr(args, "wm_text", None) else None
+    wm_pos = args.wm_pos if getattr(args, "wm_pos", None) else s.get("wm_pos", "br")
+    wm_opacity = args.wm_opacity if getattr(args, "wm_opacity", None) is not None else float(s.get("wm_opacity", 0.22))
+    return host, aspect, watermark, wm_text, wm_pos, wm_opacity
+
+def _resolve_langs(arg_lang):
+    s = _settings_defaults()
+    if arg_lang:
+        langs = [x.strip().lower() for x in str(arg_lang).split(",") if x.strip()]
+    else:
+        langs = [x.strip().lower() for x in (s.get("languages") or ["en"])]
+    # de-dupe, keep order
+    return list(dict.fromkeys(langs))
+
+def _safe_open_folder(p: pathlib.Path):
+    try:
+        if os.name == "nt":
+            os.startfile(str(p))
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", str(p)])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(p)])
+    except Exception as e:
+        print(f"WARNING: could not open {p}: {e}")
+
+# ------------------ commands ------------------
+
+def cmd_init(args):
+    base = ROOT
+    (base / "data" / "runs").mkdir(parents=True, exist_ok=True)
+    (base / "exports").mkdir(parents=True, exist_ok=True)
+    (base / "configs").mkdir(parents=True, exist_ok=True)
+
+    # settings.yaml (only if missing)
+    sy = base / "configs" / "settings.yaml"
+    if not sy.exists():
+        sy.write_text(
+            "defaults:\n"
+            "  host: http://127.0.0.1:7860\n"
+            "  languages: [en]\n"
+            "  aspect: 4x5\n"
+            "  watermark: off\n"
+            "  wm_text: \"\"\n"
+            "  wm_pos: br\n"
+            "  wm_opacity: 0.22\n"
+            "  # sd client knobs\n"
+            "  sd_timeout: 60\n"
+            "  sd_retries: 3\n"
+            "  sampler_name: \"\"\n",
+            encoding="utf-8",
+        )
+        print(f"Created -> {sy}")
+
+    # feeds.yaml (only if missing)
+    fy = base / "configs" / "feeds.yaml"
+    if not fy.exists():
+        fy.write_text(
+            "rss:\n"
+            "  - https://www.thehindu.com/news/national/feeder/default.rss\n"
+            "  - https://indianexpress.com/section/india/feed/\n"
+            "  - https://www.thehindu.com/opinion/editorial/feeder/default.rss\n",
+            encoding="utf-8",
+        )
+        print(f"Created -> {fy}")
+
+    print("Init complete. You can now run: python -m satyagrah research && python -m satyagrah triage --date latest")
+
+def cmd_research(args):
+    date = _resolve_date(args.date)
+    feeds = args.feeds.split(",") if args.feeds else load_feeds_yaml().get("rss", [])
+    if not feeds:
+        print("No feeds configured. Add to configs/feeds.yaml or pass --feeds url1,url2")
+        return 2
+    items = fetch_from_feeds(feeds)
+    path = write_topics(date, items)
+    print(f"Topics saved ({len(items)}) -> {path}")
+
+def cmd_triage(args):
+    date = _resolve_date(args.date)
+    path = shortlist(date=date, top=args.top, dedupe_threshold=args.threshold)
+    print(f"Shortlist saved -> {path}")
+
+def cmd_quick(args):
+    date = _resolve_date(args.date)
+    sl_path = ROOT / "data" / "runs" / date / "shortlist.json"
+    if not sl_path.exists():
+        print(f"Missing shortlist: {sl_path}")
+        print(f"Run: python -m satyagrah research && python -m satyagrah triage --date {date}")
+        return 2
+    sl = json.loads(sl_path.read_text(encoding="utf-8")).get("items", [])
+    if not sl:
+        print("Shortlist is empty.")
+        return 2
+    idx = max(1, int(args.idx))
+    if idx > len(sl):
+        print(f"Index {idx} > shortlist size {len(sl)}")
+        return 2
+
+    item = sl[idx - 1]
+    raw_id = item.get("id") or f"raw{idx}"
+    topic_id = ensure_friendly_id(date, raw_id, preferred_index=idx) if args.id == "auto" else args.id
+
+    title = (item.get("title") or "Top story").strip()
+    source = item.get("source", "")
+    published = item.get("published", "")
+
+    # 1) angle -> prompt JSON
+    angle = angle_from_title(title)
+    prompt = build_prompt(angle)
+    run_dir = ROOT / "data" / "runs" / date / "prompts"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    pjson = run_dir / f"{topic_id}.prompt.json"
+    pjson.write_text(json.dumps(prompt, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Prompt -> {pjson}")
+
+    host, aspect, watermark, wm_text, wm_pos, wm_opacity = _resolve_defaults(args)
+
+    # 2) image (skippable, seed support)
+    hero = ROOT / "data" / "runs" / date / "art" / f"{topic_id}_hero.png"
+    if getattr(args, "skip_image", False) and hero.exists():
+        print(f"Image (skipped) -> {hero}")
+    else:
+        if getattr(args, "skip_image", False) and not hero.exists():
+            print("WARNING: --skip_image set but hero not found; generating image.")
+        if not sdapi_ping(host):
+            print(f"WARNING: Cannot reach {host}. Start AUTOMATIC1111 with --api or run mock:")
+            print("         uvicorn satyagrah.mock_sdapi:app --host 127.0.0.1 --port 7860")
+            return 2
+        img = generate_image_for_id(topic_id, date, host=host, seed=args.seed)
+        print(f"Image  -> {img}")
+        if args.seed is not None:
+            sd_path = ROOT / "data" / "runs" / date / "seeds.json"
+            seeds = json.loads(sd_path.read_text(encoding="utf-8")) if sd_path.exists() else {}
+            seeds[str(topic_id)] = int(args.seed)
+            sd_path.write_text(json.dumps(seeds, indent=2), encoding="utf-8")
+            print(f"Seed saved -> {sd_path}")
+
+    # 3) facts stub
+    bullets = [b for b in [f"Source: {source}" if source else "", f"Published: {published}" if published else ""] if b]
+    fpath = write_facts_stub(topic_id, date, title, bullets)
+    print(f"Facts  -> {fpath}")
+
+    # 4) layout
+    aspects = ["4x5", "1x1", "9x16"] if str(aspect).lower() == "all" else [aspect]
+    outs = [
+        render_onepager(date, topic_id, aspect=a, watermark=watermark, wm_text=wm_text, wm_pos=wm_pos, wm_opacity=wm_opacity)
+        for a in aspects
+    ]
+    print("Layout -> " + " | ".join(str(p) for p in outs))
+
+    # 5) captions (multi-lang)
+    langs = _resolve_langs(args.lang)
+    one_liner = (prompt.get("positive", "").split("--", 1)[0] or "Satire").strip()
+    for lg in langs:
+        cap = build_caption(one_liner, title, lang=lg)
+        cap_path = write_caption(date, cap, lang=lg)
+        print(f"Caption[{lg}] -> {cap_path}")
+
+    # 6) optional package
+    if args.package:
+        z = make_postpack(topic_id, date)
+        print(f"ZIP    -> {z}")
+
+    # 7) optional saveas: write stable copies into exports/<date>/ as tX_*.* and postpack_<id>.zip
+    if getattr(args, "saveas", False):
+        exp = ROOT / "exports" / date
+        copied = []
+        for a in aspects:
+            for ext in ("png", "jpg"):
+                src = exp / f"onepager_{a}.{ext}"
+                if src.exists():
+                    dst = exp / f"{topic_id}_{a}.{ext}"
+                    try:
+                        dst.write_bytes(src.read_bytes()); copied.append(dst)
+                    except Exception as e:
+                        print(f"WARNING: could not write {dst}: {e}")
+        for lg in langs:
+            src = exp / f"caption_{lg}.txt"
+            if src.exists():
+                dst = exp / f"{topic_id}_caption_{lg}.txt"
+                try:
+                    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8"); copied.append(dst)
+                except Exception as e:
+                    print(f"WARNING: could not write {dst}: {e}")
+        postpack = exp / "postpack.zip"
+        if postpack.exists():
+            dst = exp / f"postpack_{topic_id}.zip"
+            try:
+                dst.write_bytes(postpack.read_bytes()); copied.append(dst)
+            except Exception as e:
+                print(f"WARNING: could not write {dst}: {e}")
+        if copied:
+            print(f"Saved copies for {topic_id} in {exp}")
+
+def cmd_batch(args):
+    date = _resolve_date(args.date)
+    sl_path = ROOT / "data" / "runs" / date / "shortlist.json"
+    if not sl_path.exists():
+        print(f"Missing shortlist: {sl_path}")
+        print(f"Run: python -m satyagrah research && python -m satyagrah triage --date {date}")
+        return 2
+    sl = json.loads(sl_path.read_text(encoding="utf-8")).get("items", [])
+    if not sl:
+        print("Shortlist is empty.")
+        return 2
+
+    indices_raw = (getattr(args, "indices", None) or "").strip()
+    if indices_raw:
+        try:
+            indices = [int(x.strip()) for x in indices_raw.split(",") if x.strip()]
+        except Exception:
+            print(f"Invalid --indices: {indices_raw}")
+            return 2
+        indices = [i for i in indices if 1 <= i <= len(sl)]
+        if not indices:
+            print("No valid indices to process.")
+            return 2
+        print(f"Batch: processing indices {indices} from shortlist ({sl_path})")
+    else:
+        total = min(max(1, int(args.top)), len(sl))
+        indices = list(range(1, total + 1))
+        print(f"Batch: processing top {total} items from shortlist ({sl_path})")
+
+    host, aspect, watermark, wm_text, wm_pos, wm_opacity = _resolve_defaults(args)
+    langs = _resolve_langs(args.lang)
+
+    for i in indices:
+        print(f"\n=== [{indices.index(i)+1}/{len(indices)}] quick pipeline (idx={i}) ===\n")
+        ns = argparse.Namespace(
+            idx=i, id="auto", date=args.date,
+            host=host, aspect=aspect,
+            watermark=watermark, wm_text=wm_text, wm_pos=wm_pos, wm_opacity=wm_opacity,
+            lang=",".join(langs),
+            skip_image=args.skip_image, package=args.package, seed=args.seed, saveas=getattr(args, "saveas", False)
+        )
+        try:
+            cmd_quick(ns)
+        except SystemExit:
+            pass
+
+    # write social.csv if requested
+    if getattr(args, "csv", False):
+        try:
+            ns = argparse.Namespace(
+                date=date,
+                aspect=getattr(args, "aspect", "all") or "all",
+                lang=getattr(args, "lang", "en,hi"),
+                out=str(ROOT / "exports" / date / "social.csv"),
+            )
+            cmd_socialcsv(ns)
+        except SystemExit:
+            pass
+
+def cmd_smoke(args):
+    out = render_smoke(_resolve_date(args.date))
+    print(f"OK -> {out}")
+
+def cmd_prompt(args):
+    angle = {
+        "one_liner": args.one_liner,
+        "metaphor": args.metaphor,
+        "style": args.style,
+        "risk": args.risk
+    }
+    prompt = build_prompt(angle)
+    date = _resolve_date(args.date)
+    run_dir = ROOT / "data" / "runs" / date / "prompts"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / f"{args.id}.prompt.json"
+    out_path.write_text(json.dumps(prompt, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Prompt saved -> {out_path}")
+
+def cmd_image(args):
+    date = _resolve_date(args.date)
+    host, *_ = _resolve_defaults(args)
+    if not sdapi_ping(host):
+        print(f"WARNING: Cannot reach {host}. Start AUTOMATIC1111 with --api or run mock:")
+        print("         uvicorn satyagrah.mock_sdapi:app --host 127.0.0.1 --port 7860")
+        return 2
+    out = generate_image_for_id(args.id, date, host=host, seed=args.seed)
+    print(f"Image saved -> {out}")
+
+def cmd_facts(args):
+    date = _resolve_date(args.date)
+    bullets = [b.strip() for b in (args.bullets or "").split("|") if b.strip()]
+    p = write_facts_stub(args.id, date, args.summary, bullets)
+    print(f"Facts saved -> {p}")
+
+def cmd_layout(args):
+    date = _resolve_date(args.date)
+    try:
+        topic_id = resolve_topic_id(date, args.id)
+    except FileNotFoundError as e:
+        print(f"WARNING: {e}")
+        return 2
+    _, aspect, watermark, wm_text, wm_pos, wm_opacity = _resolve_defaults(args)
+    aspects = ["4x5", "1x1", "9x16"] if str(aspect).lower() == "all" else [aspect]
+    out_paths = [
+        render_onepager(date, topic_id, aspect=a, watermark=watermark, wm_text=wm_text, wm_pos=wm_pos, wm_opacity=wm_opacity)
+        for a in aspects
+    ]
+    print("One-pager -> " + " | ".join(str(p) for p in out_paths))
+
+def cmd_captions(args):
+    date = _resolve_date(args.date)
+    try:
+        topic_id = resolve_topic_id(date, args.id)
+    except FileNotFoundError as e:
+        print(f"WARNING: {e}")
+        return 2
+    pjson = ROOT / "data" / "runs" / date / "prompts" / f"{topic_id}.prompt.json"
+    one_liner = "Satire"
+    if pjson.exists():
+        pj = json.loads(pjson.read_text(encoding="utf-8"))
+        one_liner = (pj.get("positive", "").split("--", 1)[0] or "Satire").strip()
+    facts = read_facts(date)
+    summary = facts.get(topic_id, {}).get("summary", "No facts yet.")
+    langs = _resolve_langs(args.lang)
+    outs = []
+    for lg in langs:
+        cap = build_caption(one_liner, summary, lang=lg)
+        out = write_caption(date, cap, lang=lg)
+        outs.append(out)
+    print("Caption -> " + " | ".join(str(p) for p in outs))
+
+def cmd_hashtags(args):
+    date = _resolve_date(args.date)
+    langs = _resolve_langs(args.lang)
+    for lg in langs:
+        tags = make_hashtags(topic=args.topic, region=args.region, lang=lg)
+        cap_path = ROOT / "exports" / date / f"caption_{lg}.txt"
+        previous = cap_path.read_text(encoding="utf-8") if cap_path.exists() else ""
+        new_text = previous + ("\n\n" if previous else "") + tags
+        cap_path.parent.mkdir(parents=True, exist_ok=True)
+        cap_path.write_text(new_text, encoding="utf-8")
+        print(f"Hashtags appended [{lg}] -> {cap_path}")
+        print(tags)
+
+def cmd_thumbs(args):
+    date = _resolve_date(args.date)
+    outs = make_thumbs(date)
+    if outs:
+        print("JPGs -> " + " | ".join(str(p) for p in outs))
+    else:
+        print("No PNG one-pagers found to convert. Run layout/quick first.")
+
+def cmd_package(args):
+    date = _resolve_date(args.date)
+    try:
+        topic_id = resolve_topic_id(date, args.id)
+    except FileNotFoundError as e:
+        print(f"WARNING: {e}")
+        return 2
+    z = make_postpack(topic_id, date)
+    print(f"ZIP ready -> {z}")
+
+def cmd_settings(args):
+    s = _settings_defaults()
+    host, aspect, watermark, wm_text, wm_pos, wm_opacity = _resolve_defaults(args)
+    cfg_path = ROOT / "configs" / "settings.yaml"
+    print(f"Settings file: {cfg_path} {'(missing -> using built-ins)' if not cfg_path.exists() else ''}")
+    print("File defaults:", json.dumps(s, indent=2))
+    print("Effective:", json.dumps({
+        "host": host, "aspect": aspect, "watermark": watermark,
+        "wm_text": wm_text, "wm_pos": wm_pos, "wm_opacity": wm_opacity
+    }, indent=2))
+
+def cmd_doctor(args):
+    s = _settings_defaults()
+    host = getattr(args, "host", None) or s.get("host", "http://127.0.0.1:7860")
+    rows = doctor_run(host, fix=getattr(args, "fix", False))
+    failed = False
+    for name, info, ok in rows:
+        print(f"[{'OK' if ok else '!!'}] {name}: {info}")
+        if not ok:
+            failed = True
+    if getattr(args, "strict", False) and failed:
+        return 2
+    return 0
+
+def cmd_cleanup(args):
+    keep = max(1, int(getattr(args, "keep", 14)))
+
+    def _prune(dirpath: pathlib.Path):
+        if not dirpath.exists():
+            return
+        items = [p for p in dirpath.iterdir() if p.is_dir()]
+        items.sort(key=lambda p: p.name, reverse=True)
+        stale = items[keep:]
+        for p in stale:
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                print(f"Deleted -> {p}")
+            except Exception as e:
+                print(f"WARNING: Could not delete {p}: {e}")
+
+    _prune(ROOT / "data" / "runs")
+    _prune(ROOT / "exports")
+    print(f"Cleanup done (kept last {keep}).")
+
+def cmd_socialcsv(args):
+    date = _resolve_date(args.date)
+    langs = _resolve_langs(getattr(args, "lang", "en"))
+    aspects = ["4x5", "1x1", "9x16"] if (getattr(args, "aspect", "all") or "all").lower() == "all" else [args.aspect]
+    exp = ROOT / "exports" / date
+    rows = []
+    caps = {}
+    for lg in langs:
+        p = exp / f"caption_{lg}.txt"
+        caps[lg] = p.read_text(encoding="utf-8") if p.exists() else ""
+    for a in aspects:
+        png = exp / f"onepager_{a}.png"
+        jpg = exp / f"onepager_{a}.jpg"
+        if not png.exists() and not jpg.exists():
+            continue
+        rows.append({
+            "date": date,
+            "aspect": a,
+            "png_path": str(png) if png.exists() else "",
+            "jpg_path": str(jpg) if jpg.exists() else "",
+            "caption_en": caps.get("en", ""),
+            "caption_hi": caps.get("hi", ""),
+        })
+    if not rows:
+        print(f"No one-pagers found under {exp}. Run layout/quick first.")
+        return 2
+    out = pathlib.Path(getattr(args, "out", "")) if getattr(args, "out", None) else (exp / "social.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"CSV -> {out}")
+
+def cmd_seeds(args):
+    date = _resolve_date(args.date)
+    sd_path = ROOT / "data" / "runs" / date / "seeds.json"
+    if not sd_path.exists():
+        print(f"No seeds.json found for {date}: {sd_path}")
+        return 2
+    try:
+        data = json.loads(sd_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Could not read seeds.json: {e}")
+        return 2
+    print(f"Seeds file: {sd_path}")
+    print("topic_id         | seed")
+    print("-----------------|-----------")
+    for k in sorted(data.keys()):
+        try:
+            v = int(data[k])
+        except Exception:
+            v = data[k]
+        print(f"{str(k):15} | {v}")
+
+# ----- feeds subcommands -----
+
+def cmd_feeds_list(args):
+    fy = ROOT / "configs" / "feeds.yaml"
+    cfg = load_feeds_yaml() or {}
+    rss = cfg.get("rss") or []
+    print(f"Feeds file: {fy} {'(missing)' if not fy.exists() else ''}")
+    if not rss:
+        print("(empty)")
+        return 0
+    for i, u in enumerate(rss, 1):
+        print(f"{i:2d}. {u}")
+    return 0
+
+def cmd_feeds_add(args):
+    import yaml
+    fy = ROOT / "configs" / "feeds.yaml"
+    fy.parent.mkdir(parents=True, exist_ok=True)
+    data = load_feeds_yaml() or {}
+    rss = list(data.get("rss") or [])
+    url = getattr(args, "url", "").strip()
+    if not url:
+        print("No URL provided.")
+        return 2
+    rss.append(url)
+    data["rss"] = rss
+    fy.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    print(f"Added -> {url}")
+    print(f"Feeds file: {fy}")
+    return 0
+
+def cmd_feeds_remove(args):
+    import yaml
+    fy = ROOT / "configs" / "feeds.yaml"
+    data = load_feeds_yaml() or {}
+    rss = list(data.get("rss") or [])
+    idx = max(1, int(getattr(args, "index", 0)))
+    if idx > len(rss):
+        print(f"Index {idx} out of range (1..{len(rss)})")
+        return 2
+    removed = rss.pop(idx - 1)
+    data["rss"] = rss
+    fy.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    print(f"Removed -> {removed}")
+    print(f"Feeds file: {fy}")
+    return 0
+
+def cmd_feeds_reset(args):
+    """
+    Restore configs/feeds.yaml from backup, a supplied file, or built-in defaults.
+    Priority:
+      1) --from <path> (validate it exists)
+      2) configs/feeds.backup.yaml if present
+      3) built-in defaults
+    """
+    import yaml
+    cfg_dir = ROOT / "configs"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg = cfg_dir / "feeds.yaml"
+    bak = cfg_dir / "feeds.backup.yaml"
+
+    src_path = getattr(args, "from_path", None)
+    if src_path:
+        sp = pathlib.Path(src_path)
+        if not sp.exists():
+            print(f"--from file not found: {sp}")
+            return 2
+        try:
+            data = yaml.safe_load(sp.read_text(encoding="utf-8")) or {}
+            if "rss" not in data or not isinstance(data["rss"], list):
+                print("Provided file is not a valid feeds.yaml (missing 'rss' list).")
+                return 2
+        except Exception as e:
+            print(f"Could not read YAML from {sp}: {e}")
+            return 2
+        cfg.write_text(sp.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"Restored feeds from -> {sp}")
+        print(f"Feeds file: {cfg}")
+        return 0
+
+    if bak.exists():
+        shutil.copyfile(bak, cfg)
+        print(f"Restored feeds from backup -> {bak}")
+        print(f"Feeds file: {cfg}")
+        return 0
+
+    defaults = {
+        "rss": [
+            "https://www.thehindu.com/news/national/feeder/default.rss",
+            "https://indianexpress.com/section/india/feed/",
+            "https://www.thehindu.com/opinion/editorial/feeder/default.rss",
+        ]
+    }
+    cfg.write_text(yaml.safe_dump(defaults, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    print("No backup found; wrote built-in default feeds.")
+    print(f"Feeds file: {cfg}")
+    return 0
+
+def cmd_open(args):
+    date = _resolve_date(args.date)
+    if args.what == "exports":
+        path = ROOT / "exports" / date
+    elif args.what == "runs":
+        path = ROOT / "data" / "runs" / date
+    else:
+        print("Unknown --what. Use: exports|runs")
+        return 2
+    if not path.exists():
+        print(f"Path not found: {path}")
+        return 2
+    _safe_open_folder(path)
+    print(f"Opened -> {path}")
+
+def cmd_publish(args):
+    date = _resolve_date(getattr(args, "date", None))
+    topic_id = getattr(args, "id", "auto")
+    try:
+        topic_id = resolve_topic_id(date, topic_id)
+    except Exception:
+        if topic_id == "auto":
+            topic_id = "t1"
+
+    exp = ROOT / "exports" / date
+    outdir = pathlib.Path(getattr(args, "to", "") or (exp / "outbox"))
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # choose aspects (prefer --image over --aspect/all)
+    img = getattr(args, "image", None)
+    aspects = [img] if img else (["4x5", "1x1", "9x16"] if (getattr(args, "aspect", "all") or "all").lower() == "all" else [args.aspect])
+
+    copied: List[pathlib.Path] = []
+
+    # images -> <topic_id>_<aspect>.<ext>
+    for a in aspects:
+        for ext in ("png", "jpg"):
+            src = exp / f"onepager_{a}.{ext}"
+            if src.exists():
+                dst = outdir / f"{topic_id}_{a}.{ext}"
+                try:
+                    dst.write_bytes(src.read_bytes()); copied.append(dst)
+                except Exception as e:
+                    print(f"WARNING: could not write {dst}: {e}")
+
+    # captions -> <topic_id>_caption_<lang>.txt
+    langs = [x.strip() for x in (getattr(args, "lang", "en") or "en").split(",") if x.strip()]
+    for lg in langs:
+        src = exp / f"caption_{lg}.txt"
+        if src.exists():
+            dst = outdir / f"{topic_id}_caption_{lg}.txt"
+            try:
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8"); copied.append(dst)
+            except Exception as e:
+                print(f"WARNING: could not write {dst}: {e}")
+
+    # optional CSV alongside
+    if getattr(args, "csv", False):
+        try:
+            ns = argparse.Namespace(date=date, aspect=(getattr(args, "aspect", "all") or "all"), lang=",".join(langs), out=str(outdir / "social.csv"))
+            cmd_socialcsv(ns)
+        except SystemExit:
+            pass
+
+    # platform-tagged duplicates for convenience (e.g., t8_youtube_1x1.jpg)
+    plat = getattr(args, "platform", None)
+    if plat:
+        tag = "".join(ch for ch in str(plat).lower() if ch.isalnum() or ch in "-_")
+        # duplicate images with platform prefix
+        for a in aspects:
+            for ext in ("png", "jpg"):
+                src = outdir / f"{topic_id}_{a}.{ext}"
+                if src.exists():
+                    dstp = outdir / f"{topic_id}_{tag}_{a}.{ext}"
+                    try:
+                        dstp.write_bytes(src.read_bytes()); copied.append(dstp)
+                    except Exception as e:
+                        print(f"WARNING: could not write {dstp}: {e}")
+        # duplicate captions with platform prefix
+        for lg in langs:
+            src = outdir / f"{topic_id}_caption_{lg}.txt"
+            if src.exists():
+                dstp = outdir / f"{topic_id}_{tag}_caption_{lg}.txt"
+                try:
+                    dstp.write_text(src.read_text(encoding="utf-8"), encoding="utf-8"); copied.append(dstp)
+                except Exception as e:
+                    print(f"WARNING: could not write {dstp}: {e}")
+
+    if copied:
+        print("Publish -> " + " | ".join(str(p) for p in copied))
+    print(f"Ready in -> {outdir}")
+
+def cmd_telegram(args):
+    import os, csv, time, requests, argparse, pathlib as _pl
+    date = _resolve_date(getattr(args, "date", None))
+    exp  = ROOT / "exports" / date
+    csv_path = exp / "social.csv"
+    # auto-create CSV if missing
+    if not csv_path.exists():
+        try:
+            ns = argparse.Namespace(
+                date=date,
+                aspect=(getattr(args, "aspect", "all") or "all"),
+                lang=getattr(args, "lang", "en,hi"),
+                out=str(csv_path),
+            )
+            cmd_socialcsv(ns)
+        except SystemExit:
+            pass
+
+    if not csv_path.exists():
+        print(f"No social.csv found at {csv_path}. Run socialcsv or batch --csv.")
+        return 2
+
+    token = os.environ.get("SATYAGRAH_TELEGRAM_BOT")
+    if not token:
+        print("Missing env SATYAGRAH_TELEGRAM_BOT")
+        return 2
+    chat_id = getattr(args, "chat", None)
+    if not chat_id:
+        print("Provide --chat <CHAT_ID>")
+        return 2
+
+    langs = [x.strip() for x in (getattr(args, "lang", "en,hi") or "en,hi").split(",") if x.strip()]
+
+    # read CSV and optionally filter aspect
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    aspect = (getattr(args, "aspect", "all") or "all").lower()
+    if aspect != "all":
+        rows = [row for row in rows if row.get("aspect", "").lower() == aspect]
+
+    limit = getattr(args, "limit", None)
+    try:
+        limit = int(limit) if limit is not None else None
+    except Exception:
+        limit = None
+
+    try:
+        delay = float(getattr(args, "delay", 1.0) or 1.0)
+    except Exception:
+        delay = 1.0
+
+    sent = 0
+    skipped = 0
+    count = 0
+    for row in rows:
+        if limit is not None and count >= limit:
+            break
+
+        img = row.get("jpg_path") or row.get("png_path") or ""
+        if not img or not _pl.Path(img).exists():
+            skipped += 1
+            continue
+
+        # pick caption by preferred lang
+        caption = ""
+        for lg in langs:
+            key = f"caption_{lg}"
+            if row.get(key):
+                caption = row[key]
+                break
+        if not caption:
+            caption = row.get("caption_en", "") or ""
+
+        if getattr(args, "dry_run", False):
+            # precompute preview safely (no backslashes in f-string expression)
+            txt = caption.replace("\r\n", "\n").replace("\r", "\n")
+            preview = " / ".join(txt.split("\n"))[:60]
+            print(f"[DRY] sendPhoto chat={chat_id} file={img} caption={preview}...")
+            sent += 1
+            count += 1
+            continue
+
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        name = _pl.Path(img).name
+        lower = name.lower()
+        mime = "image/jpeg" if lower.endswith((".jpg", ".jpeg")) else "image/png"
+
+        try:
+            with open(img, "rb") as fh:
+                files = {"photo": (name, fh, mime)}
+                data = {"chat_id": chat_id, "caption": caption}
+                resp = requests.post(url, data=data, files=files, timeout=30)
+            if resp.ok:
+                sent += 1
+                count += 1
+                print(f"Sent -> {img}")
+                time.sleep(delay)
+            else:
+                print(f"[ERR] {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            print(f"[ERR] {e}")
+
+    print(f"Done. sent={sent}, skipped={skipped}")
+
+# ------------------ main ------------------
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="satyagrah",
+        description="AI Satyagrah tools (ASCII-only help for Windows terminals)"
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    initp = sub.add_parser("init", help="Create folders and starter configs")
+    initp.set_defaults(func=cmd_init)
+
+    r = sub.add_parser("research", help="Fetch RSS into data/runs/<date>/topics.json")
+    r.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    r.add_argument("--feeds", default=None, help="Comma-separated RSS URLs (override configs/feeds.yaml)")
+    r.set_defaults(func=cmd_research)
+
+    t = sub.add_parser("triage", help="Deduplicate and score into shortlist.json")
+    t.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    t.add_argument("--top", type=int, default=6)
+    t.add_argument("--threshold", type=int, default=92)
+    t.set_defaults(func=cmd_triage)
+
+    qk = sub.add_parser("quick", help="Item #idx -> prompt,image,facts,layout,captions [--package]")
+    qk.add_argument("--idx", type=int, default=1)
+    qk.add_argument("--id", default="auto", help="auto maps shortlist item to t1/t2...; or provide custom ID")
+    qk.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    qk.add_argument("--host", default=None)
+    qk.add_argument("--aspect", default=None, help="4x5|1x1|9x16|all")
+    qk.add_argument("--watermark", default=None, help="on|off")
+    qk.add_argument("--wm_text", default=None)
+    qk.add_argument("--wm_pos", default=None, help="tl|tr|bl|br")
+    qk.add_argument("--wm_opacity", type=float, default=None)
+    qk.add_argument("--lang", default=None, help="e.g., en,hi")
+    qk.add_argument("--skip_image", action="store_true", help="Reuse existing hero if present")
+    qk.add_argument("--seed", type=int, default=None, help="Reproducible seed for image generation")
+    qk.add_argument("--package", action="store_true")
+    qk.add_argument("--saveas", action="store_true", help="Copy onepagers/postpack to <id>_* after run")
+    qk.set_defaults(func=cmd_quick)
+
+    b = sub.add_parser("batch", help="Run quick for selected shortlist items")
+    b.add_argument("--top", type=int, default=3)
+    b.add_argument("--indices", default=None, help="Comma-separated shortlist indices (e.g., 1,3,5). Overrides --top.")
+    b.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    b.add_argument("--host", default=None)
+    b.add_argument("--aspect", default=None, help="4x5|1x1|9x16|all")
+    b.add_argument("--watermark", default=None, help="on|off")
+    b.add_argument("--wm_text", default=None)
+    b.add_argument("--wm_pos", default=None, help="tl|tr|bl|br")
+    b.add_argument("--wm_opacity", type=float, default=None)
+    b.add_argument("--skip_image", action="store_true")
+    b.add_argument("--seed", type=int, default=None)
+    b.add_argument("--package", action="store_true")
+    b.add_argument("--saveas", action="store_true")
+    b.add_argument("--csv", action="store_true", help="Write social.csv after batch")
+    b.add_argument("--lang", default="en,hi", help="Languages for CSV (e.g., en or en,hi)")
+    b.set_defaults(func=cmd_batch)
+
+    s = sub.add_parser("smoke", help="Render the smoke-test one-pager")
+    s.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    s.set_defaults(func=cmd_smoke)
+
+    q = sub.add_parser("prompt", help="Build a SDXL prompt JSON")
+    q.add_argument("--id", required=True)
+    q.add_argument("--one_liner", required=True)
+    q.add_argument("--metaphor", default="courtroom")
+    q.add_argument("--style", default="rk_lineart")
+    q.add_argument("--risk", default="high")
+    q.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    q.set_defaults(func=cmd_prompt)
+
+    i = sub.add_parser("image", help="Generate hero.png via A1111/mock")
+    i.add_argument("--id", required=True)
+    i.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    i.add_argument("--host", default=None)
+    i.add_argument("--seed", type=int, default=None)
+    i.set_defaults(func=cmd_image)
+
+    f = sub.add_parser("facts", help="Write or update a facts stub")
+    f.add_argument("--id", required=True)
+    f.add_argument("--summary", required=True)
+    f.add_argument("--bullets", default="")
+    f.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    f.set_defaults(func=cmd_facts)
+
+    l = sub.add_parser("layout", help="Render one-pager using hero and facts")
+    l.add_argument("--id", default="auto", help="friendly id (t1/t2/...) or 'auto'")
+    l.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    l.add_argument("--aspect", default=None, help="4x5|1x1|9x16|all")
+    l.add_argument("--watermark", default=None, help="on|off")
+    l.add_argument("--wm_text", default=None)
+    l.add_argument("--wm_pos", default=None, help="tl|tr|bl|br")
+    l.add_argument("--wm_opacity", type=float, default=None)
+    l.set_defaults(func=cmd_layout)
+
+    c = sub.add_parser("captions", help="Create caption_<lang>.txt from prompt and facts")
+    c.add_argument("--id", default="auto", help="friendly id (t1/t2/...) or 'auto'")
+    c.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    c.add_argument("--lang", default="en", help="e.g., en or en,hi")
+    c.set_defaults(func=cmd_captions)
+
+    h = sub.add_parser("hashtags", help="Append smart hashtags to caption_<lang>.txt")
+    h.add_argument("--topic", default="judiciary")
+    h.add_argument("--region", default="india")
+    h.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    h.add_argument("--lang", default="en", help="e.g., en or en,hi")
+    h.set_defaults(func=cmd_hashtags)
+
+    g = sub.add_parser("thumbs", help="Convert onepager PNGs to optimized JPGs")
+    g.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    g.set_defaults(func=cmd_thumbs)
+
+    k = sub.add_parser("package", help="Create exports/<date>/postpack.zip")
+    k.add_argument("--id", default="auto", help="friendly id (t1/t2/...) or 'auto'")
+    k.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    k.set_defaults(func=cmd_package)
+
+    x = sub.add_parser("settings", help="Show file defaults and effective values")
+    x.add_argument("--host", default=None)
+    x.add_argument("--aspect", default=None, help="4x5|1x1|9x16|all")
+    x.add_argument("--watermark", default=None, help="on|off")
+    x.add_argument("--wm_text", default=None)
+    x.add_argument("--wm_pos", default=None, help="tl|tr|bl|br")
+    x.add_argument("--wm_opacity", type=float, default=None)
+    x.set_defaults(func=cmd_settings)
+
+    d = sub.add_parser("doctor", help="Environment checks")
+    d.add_argument("--host", default=None)
+    d.add_argument("--strict", action="store_true", help="Exit 2 on any failed check")
+    d.add_argument("--fix", action="store_true", help="Try to suggest simple fixes")
+    d.set_defaults(func=cmd_doctor)
+
+    op = sub.add_parser("open", help="Open run/export folder in Explorer")
+    op.add_argument("--what", required=True, choices=["exports", "runs"])
+    op.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    op.set_defaults(func=cmd_open)
+
+    pb = sub.add_parser("publish", help="Copy exports to an outbox with stable names")
+    pb.add_argument("--id", default="auto")
+    pb.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    pb.add_argument("--aspect", default="all", help="4x5|1x1|9x16|all")
+    pb.add_argument("--image", choices=["4x5", "1x1", "9x16"], default=None, help="Only copy this one aspect")
+    pb.add_argument("--platform", choices=[
+        "instagram", "instagram-stories", "twitter", "x", "linkedin", "facebook",
+        "shorts", "youtube", "whatsapp", "telegram", "threads", "mastodon", "reddit", "pinterest", "snapchat"
+    ], default=None, help="Optional platform tag (also writes platform-tagged copies)")
+    pb.add_argument("--lang", default="en", help="e.g., en or en,hi")
+    pb.add_argument("--to", default=None, help="Destination folder (defaults to exports/<date>/outbox)")
+    pb.add_argument("--csv", action="store_true", help="Also write social.csv next to files")
+    pb.add_argument("--open", action="store_true", help="Open outbox after publishing")
+    pb.set_defaults(func=cmd_publish)
+
+    tg = sub.add_parser("telegram", help="Send social.csv images+captions to Telegram")
+    tg.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    tg.add_argument("--aspect", default="all", help="4x5|1x1|9x16|all (for CSV auto-gen)")
+    tg.add_argument("--lang", default="en,hi", help="Caption language preference, e.g., en or en,hi")
+    tg.add_argument("--chat", default=None, help="Telegram chat_id to send to")
+    tg.add_argument("--limit", type=int, default=None, help="Send only the first N rows")
+    tg.add_argument("--delay", type=float, default=1.0, help="Seconds to sleep between sends")
+    tg.add_argument("--dry-run", action="store_true", help="Print what would be sent")
+    tg.set_defaults(func=cmd_telegram)
+
+    cl = sub.add_parser("cleanup", help="Delete old runs/exports, keep last N")
+    cl.add_argument("--keep", type=int, default=14)
+    cl.set_defaults(func=cmd_cleanup)
+
+    sc = sub.add_parser("socialcsv", help="Export CSV of images and captions")
+    sc.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    sc.add_argument("--aspect", default="all", help="4x5|1x1|9x16|all")
+    sc.add_argument("--lang", default="en", help="e.g., en or en,hi")
+    sc.add_argument("--out", default=None, help="Optional custom CSV path")
+    sc.set_defaults(func=cmd_socialcsv)
+
+    sds = sub.add_parser("seeds", help="Show seeds.json for a date")
+    sds.add_argument("--date", default=None, help="YYYY-MM-DD or 'latest'")
+    sds.set_defaults(func=cmd_seeds)
+
+    # feeds group
+    fd = sub.add_parser("feeds", help="Manage configs/feeds.yaml")
+    fsp = fd.add_subparsers(dest="feeds_cmd", required=True)
+
+    fd_list = fsp.add_parser("list", help="List current feeds")
+    fd_list.set_defaults(func=cmd_feeds_list)
+
+    fd_add = fsp.add_parser("add", help="Add a feed URL")
+    fd_add.add_argument("url")
+    fd_add.set_defaults(func=cmd_feeds_add)
+
+    fd_rm = fsp.add_parser("remove", help="Remove a feed by 1-based index")
+    fd_rm.add_argument("--index", type=int, required=True)
+    fd_rm.set_defaults(func=cmd_feeds_remove)
+
+    fd_reset = fsp.add_parser("reset", help="Reset feeds from backup or defaults")
+    fd_reset.add_argument("--from", dest="from_path", default=None, help="Restore from this feeds.yaml")
+    fd_reset.set_defaults(func=cmd_feeds_reset)
+
+    args = p.parse_args(argv)
+    rc = args.func(args)
+    return 0 if rc is None else int(rc)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
