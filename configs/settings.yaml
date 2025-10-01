@@ -1,0 +1,9 @@
+﻿defaults:
+  host: http://127.0.0.1:7860
+  languages: [en, hi]
+  aspect: all
+  watermark: on
+  wm_text: "pindia • prototype"
+  wm_pos: br
+  wm_opacity: 0.22
+

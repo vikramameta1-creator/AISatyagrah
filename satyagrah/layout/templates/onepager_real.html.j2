@@ -1,0 +1,33 @@
+﻿<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Satyagrah — {{date}}</title>
+  <style>{{ css }}</style>
+</head>
+<body>
+  <header class="masthead">AI Satyagrah • Daily One-Pager — {{date}}</header>
+  <main class="grid">
+    <section class="card hero">
+      <img src="{{ hero_src }}" alt="hero" style="max-width:100%;max-height:100%;">
+    </section>
+    <section class="card">
+      <div><b>Hero caption</b></div>
+      <div>{{ one_liner }}</div>
+    </section>
+    <section class="card">
+      <h3>What’s the fuss?</h3>
+      <p>{{ fuss }}</p>
+    </section>
+    <section class="card">
+      <h3>Fact vs Spin</h3>
+      <ul>
+        {% for f in facts %}
+        <li>{{ f }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  </main>
+  <footer class="foot">Prototype build • @aisatyagrah</footer>
+</body>
+</html>

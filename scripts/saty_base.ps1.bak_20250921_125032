@@ -1,0 +1,79 @@
+﻿param(
+  [int]$Top = 3,
+  [int]$Seed = 12345,
+  [string]$Date = "latest",
+  [string]$Langs = "en,hi",
+  [string[]]$Platforms = @("instagram","instagram-stories","x","shorts","youtube","whatsapp","telegram")
+)
+
+function Write-Step($msg){ Write-Host ("`n=== " + $msg + " ===") -ForegroundColor Cyan }
+function SD-Alive([string]$base="http://127.0.0.1:7860"){
+  try {
+    $r = Invoke-WebRequest -UseBasicParsing -Uri $base -Method Get -TimeoutSec 2
+    return $r.StatusCode -ge 200 -and $r.StatusCode -lt 500
+  } catch { return $false }
+}
+
+$ErrorActionPreference = "Stop"
+Push-Location $root
+try {
+  Write-Step "Doctor"
+  python -m satyagrah doctor --strict
+
+  Write-Step "Research"
+  python -m satyagrah research --date $Date
+
+  Write-Step "Triage"
+  python -m satyagrah triage --date $Date
+
+  $skip = -not (SD-Alive)
+  if($skip){ Write-Host "[info] SD API not reachable -> --skip_image will be set." -ForegroundColor Yellow }
+
+  Write-Step "Batch quick ($Top items)"
+  $quickArgs = @("batch","--date",$Date,"--seed",$Seed,"--top",$Top,"--lang",$Langs,"--saveas")
+  if($skip){ $quickArgs += "--skip_image" }
+  python -m satyagrah @quickArgs
+
+  # Publish matrix per topic id t1..tN
+  $aspectMap = @{
+    instagram           = "1x1"
+    "instagram-stories" = "9x16"
+    x                   = "4x5"
+    shorts              = "9x16"
+    youtube             = "1x1"
+    whatsapp            = "1x1"
+    telegram            = "1x1"
+  }
+
+  for($i=1; $i -le $Top; $i++){
+    $tid = "t$($i)"
+    Write-Step "Publish $tid"
+    foreach($p in $Platforms){
+      $aspect = $aspectMap[$p]
+      if(-not $aspect){ continue }
+      $args = @("publish","--date",$Date,"--id",$tid,"--image",$aspect,"--platform",$p,"--lang",$Langs,"--csv")
+      python -m satyagrah @args
+    }
+  }
+
+  # Zip outbox
+  $today = Get-Date -Format 'yyyy-MM-dd'
+  if($Date -ne "latest"){ $today = $Date }
+  $outbox = Join-Path $root ("exports\" + $today + "\outbox")
+  if(Test-Path $outbox){
+    $zip = Join-Path $root ("exports\" + $today + "\outbox_" + $today + ".zip")
+    if(Test-Path $zip){ Remove-Item $zip -Force }
+    Compress-Archive -Path (Join-Path $outbox "*") -DestinationPath $zip
+    Write-Host ("ZIP -> " + $zip) -ForegroundColor Green
+  } else {
+    Write-Host "[warn] Outbox not found to zip." -ForegroundColor Yellow
+  }
+
+  # Open exports
+  python -m satyagrah open --what exports --date $Date
+
+  Write-Host "`nAll done." -ForegroundColor Green
+}
+finally {
+  Pop-Location
+}

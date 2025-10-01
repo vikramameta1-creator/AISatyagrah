@@ -1,0 +1,8 @@
+﻿.env
+.venv/
+__pycache__/
+exports/
+data/runs/
+*.pyc
+state.db
+logs/

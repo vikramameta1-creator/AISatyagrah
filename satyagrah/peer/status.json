@@ -1,0 +1,15 @@
+{
+  "uptime_sec": 621,
+  "processed_today": 0,
+  "queue_len": 0,
+  "last_job_id": "",
+  "last_ok": null,
+  "last_error": "",
+  "share_percent": 50,
+  "paused": false,
+  "needs_attention": false,
+  "since_last_job_sec": 621,
+  "started_at": 1759288179,
+  "inactivity_minutes": 120,
+  "max_per_day": 5
+}

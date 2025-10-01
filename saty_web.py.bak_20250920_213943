@@ -1,0 +1,757 @@
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Satyagrah Local Web UI â€” FastAPI *or* Builtâ€‘in Server Fallback (+ Offline Mode)
+===============================================================================
+
+This revision fixes sandbox crashes like:
+
+    OSError: [Errno 138] Not supported
+
+That error happens when the environment forbids opening listening sockets. We now:
+
+1) **Try FastAPI + Uvicorn** (if installed and `ssl` is available).
+2) **Fall back to a stdlib HTTP server** (no extra deps).
+3) If binding still fails (e.g., sandbox blocks networking), we **write an offline HTML**
+   page to disk and exit cleanly with guidance. The offline page preserves the UI but
+   informs you that server actions are disabled and shows the exact CLI to run manually.
+
+Also fixed: environments that surface `SystemExit: 0` as an error when running the
+module now avoid raising `SystemExit` on successful runs (exit code 0). See `_safe_exit`.
+
+We also keep prior fixes:
+- Lazy FastAPI import (avoids `ModuleNotFoundError: ssl`).
+- HTML builder avoids f-strings to prevent `{}` parse errors in CSS/JS.
+- A small self-test suite, now with extra tests for offline writer **and** safe exit.
+
+Usage
+-----
+    # Optional (richer server)
+    pip install fastapi uvicorn
+
+    # Start (auto-chooses best mode)
+    python saty_web.py --port 8000
+
+    # Force stdlib server
+    python saty_web.py --force-fallback --port 8000
+
+    # Force **offline page** (no server) to a custom path
+    python saty_web.py --offline --offline-out saty_offline.html
+
+    # Run tests
+    python saty_web.py --selftest
+
+Notes
+-----
+- Server shells out to your existing CLI: `python -m satyagrah ...` in project ROOT.
+- Override ROOT with env `SATY_ROOT`.
+- Fallback server buffers output (simple + robust). FastAPI streams line-by-line.
+"""
+from __future__ import annotations
+import os
+import sys
+import json
+import argparse
+import asyncio
+import errno
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import AsyncIterator, List, Optional, Tuple
+
+APP_TITLE = "Satyagrah â€“ Local Web UI"
+ROOT = Path(os.environ.get("SATY_ROOT") or os.getcwd())
+
+# ---------------------------- helpers ----------------------------
+
+def which_python() -> str:
+    return sys.executable or "python"
+
+async def stream_process_async(args: List[str]) -> AsyncIterator[bytes]:
+    """Spawn `python -m satyagrah <args>` and stream combined stdout/stderr as bytes (async)."""
+    py = which_python()
+    cmd = [py, "-m", "satyagrah", *args]
+    banner = "$ " + " ".join(cmd) + "\n"
+    yield banner.encode("utf-8")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(ROOT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            limit=1 << 20,
+        )
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            yield line
+        rc = await proc.wait()
+        yield f"\n[exit {rc}]\n".encode("utf-8")
+    except FileNotFoundError:
+        yield b"ERROR: Could not spawn process. Is your venv active and satyagrah importable?\n"
+    except Exception as e:
+        yield f"ERROR: {e}\n".encode("utf-8")
+
+
+def run_process_blocking(args: List[str]) -> Tuple[int, str]:
+    """Run the CLI synchronously; return (rc, combined_output). Pure stdlib.
+    Used by the fallback server (simpler than chunked streaming).
+    """
+    import subprocess
+    py = which_python()
+    cmd = [py, "-m", "satyagrah", *args]
+    try:
+        p = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        assert p.stdout is not None
+        out = ["$ " + " ".join(cmd) + "\n"]
+        for line in p.stdout:
+            out.append(line)
+        rc = p.wait()
+        out.append(f"\n[exit {rc}]\n")
+        return rc, "".join(out)
+    except FileNotFoundError:
+        return 127, "$ " + " ".join(cmd) + "\nERROR: Could not spawn process. Is venv active?\n"
+    except Exception as e:
+        return 1, f"$ {' '.join(cmd)}\nERROR: {e}\n"
+
+# ---------------------------- HTML builders (no f-strings) ----------------------------
+
+def _home_html(title: str) -> str:
+    """Return the full HTML for the home page without using f-strings.
+    This avoids brace conflicts with CSS/JS inside the template.
+    """
+    html = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>__TITLE__</title>
+<style>
+  :root { --bg:#0b0e14; --fg:#ebedf0; --muted:#a0a8b0; --card:#121622; --accent:#6ea8fe; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; }
+  .wrap { display:flex; flex-direction:column; height:100%; }
+  header { padding:12px 16px; background:var(--card); border-bottom:1px solid #222738; }
+  header h1 { margin:0; font-size:18px; letter-spacing:.3px; }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:12px; padding:12px; height:100%; box-sizing:border-box; }
+  .panel { background:var(--card); border:1px solid #222738; border-radius:12px; padding:12px; }
+  .grp { margin-bottom:14px; }
+  .grp h3 { margin:0 0 8px 0; font-size:14px; color:var(--muted); font-weight:600; }
+  label { display:inline-block; width:90px; color:var(--muted); font-size:12px; }
+  input,select { background:#0f1422; color:var(--fg); border:1px solid #2a3147; border-radius:8px; padding:6px 8px; margin:2px 0; font-size:13px; }
+  .btn { background:#11182a; color:var(--fg); border:1px solid #2a3147; border-radius:10px; padding:8px 10px; margin:4px 4px 4px 0; font-size:13px; cursor:pointer; }
+  .btn.primary { background:#1a2540; border-color:#38518a; }
+  .btn:disabled { opacity:.6; cursor:not-allowed; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0a0d16; border:1px solid #222738; height:calc(100vh - 170px); border-radius:12px; padding:10px; overflow:auto; white-space:pre-wrap; }
+  .row { display:flex; align-items:center; gap:8px; margin:4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>__TITLE__</h1>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="grp"><h3>Parameters</h3>
+        <div class="row"><label>Date</label><input id="date" value="latest"/></div>
+        <div class="row"><label>Idx</label><input id="idx" type="number" value="1"/></div>
+        <div class="row"><label>Top</label><input id="top" type="number" value="3"/></div>
+        <div class="row"><label>Indices</label><input id="indices" placeholder="e.g. 1,3,5"/></div>
+        <div class="row"><label>ID</label><input id="topic_id" value="auto"/></div>
+        <div class="row"><label>Seed</label><input id="seed" type="number" value="12345"/></div>
+        <div class="row"><label>Lang</label><input id="lang" value="en,hi"/></div>
+        <div class="row"><label>Aspect</label>
+          <select id="aspect">
+            <option value="all" selected>all</option>
+            <option value="4x5">4x5</option>
+            <option value="1x1">1x1</option>
+            <option value="9x16">9x16</option>
+          </select>
+        </div>
+        <div class="row"><label>Image</label>
+          <select id="image">
+            <option value="">(auto)</option>
+            <option value="4x5">4x5</option>
+            <option value="1x1">1x1</option>
+            <option value="9x16">9x16</option>
+          </select>
+        </div>
+        <div class="row"><label>Platform</label>
+          <select id="platform">
+            <option value="">(none)</option>
+            <option>instagram</option>
+            <option>instagram-stories</option>
+            <option>shorts</option>
+            <option>x</option>
+            <option>twitter</option>
+            <option>linkedin</option>
+            <option>facebook</option>
+          </select>
+        </div>
+        <div class="row"><label></label>
+          <label><input type="checkbox" id="skip_image"/> skip image</label>
+          <label><input type="checkbox" id="package"/> package</label>
+          <label><input type="checkbox" id="saveas" checked/> saveas</label>
+          <label><input type="checkbox" id="csv" checked/> csv</label>
+          <label><input type="checkbox" id="open"/> open</label>
+        </div>
+      </div>
+
+      <div class="grp"><h3>Pipeline</h3>
+        <button class="btn" onclick="run(['doctor','--strict'])">Doctor</button>
+        <button class="btn" onclick="run(['research','--date', val('date')])">Research</button>
+        <button class="btn" onclick="run(['triage','--date', val('date')])">Triage</button>
+        <button class="btn" onclick="quick()">Quick</button>
+        <button class="btn" onclick="batch()">Batch</button>
+        <button class="btn" onclick="layout()">Layout</button>
+        <button class="btn" onclick="run(['thumbs','--date', val('date')])">Thumbs</button>
+        <button class="btn" onclick="run(['socialcsv','--date', val('date')])">SocialCSV</button>
+        <button class="btn" onclick="run(['seeds','--date', val('date')])">Seeds</button>
+      </div>
+
+      <div class="grp"><h3>Publish</h3>
+        <button class="btn primary" onclick="publishNow()">Publish</button>
+        <button class="btn" onclick="run(['open','--what','exports','--date', val('date')])">Open exports</button>
+        <button class="btn" onclick="run(['open','--what','runs','--date', val('date')])">Open runs</button>
+      </div>
+
+      <div class="grp"><h3>Feeds</h3>
+        <button class="btn" onclick="run(['feeds','list'])">List</button>
+        <div class="row"><label>New feed</label><input id="feedurl" placeholder="https://.../feed" style="width:200px"/> <button class="btn" onclick="addFeed()">Add</button></div>
+        <div class="row"><label>Remove #</label><input id="rmindex" type="number" min="1" style="width:100px"/> <button class="btn" onclick="removeFeed()">Remove</button></div>
+        <button class="btn" onclick="run(['feeds','reset'])">Reset (backup/defaults)</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="grp"><h3>Output</h3>
+        <pre id="log"></pre>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+  let busy = false;
+  const logEl = document.getElementById('log');
+  function val(id){ return document.getElementById(id).value; }
+  function checked(id){ return document.getElementById(id).checked; }
+  const _qsParam = new URLSearchParams(location.search).get('autoclose');
+  const TOAST_TIMEOUT_MS = _qsParam !== null ? Math.max(0, Number(_qsParam)) : 4000;
+  let _toastTimer = null;
+  function append(txt){ logEl.textContent += txt; logEl.scrollTop = logEl.scrollHeight; }
+
+  async function run(args){
+    if(busy){ append("\n[busy] Wait for current task to finish...\n"); return; }
+    busy = true;
+    logEl.textContent += "\n$ python -m satyagrah " + args.join(' ') + "\n";
+    const res = await fetch('/api/run', {method: 'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({args})});
+    // Fallback server buffers output; FastAPI streams. Read the body either way.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while(true){
+      const {done, value} = await reader.read();
+      if(done) break;
+      append(decoder.decode(value));
+    }
+    busy = false;
+  }
+
+  function quick(){
+    const a = ['quick','--date', val('date'),'--idx', String(val('idx')),'--seed', String(val('seed'))];
+    const lang = val('lang'); if(lang) a.push('--lang', lang);
+    const aspect = val('aspect'); if(aspect && aspect !== 'all') a.push('--aspect', aspect);
+    if(checked('skip_image')) a.push('--skip_image');
+    if(checked('package')) a.push('--package');
+    if(checked('saveas')) a.push('--saveas');
+    const tid = val('topic_id'); if(tid && tid !== 'auto') a.push('--id', tid);
+    run(a);
+  }
+  function batch(){
+    const a = ['batch','--date', val('date'),'--seed', String(val('seed'))];
+    const raw = val('indices').trim();
+    if(raw){ a.push('--indices', raw); } else { a.push('--top', String(val('top'))); }
+    const lang = val('lang'); if(lang) a.push('--lang', lang);
+    const aspect = val('aspect'); if(aspect && aspect !== 'all') a.push('--aspect', aspect);
+    if(checked('skip_image')) a.push('--skip_image');
+    if(checked('package')) a.push('--package');
+    if(checked('saveas')) a.push('--saveas');
+    run(a);
+  }
+  function layout(){
+    const a = ['layout','--date', val('date'),'--id', val('topic_id')||'auto'];
+    const aspect = val('aspect'); if(aspect && aspect !== 'all') a.push('--aspect', aspect);
+    run(a);
+  }
+  function publishNow(){
+    const a = ['publish','--date', val('date'),'--id', val('topic_id')||'auto','--lang', (val('lang')||'en')];
+    const img = val('image'); if(img) a.push('--image', img);
+    const plat = val('platform'); if(plat) a.push('--platform', plat);
+    if(checked('csv')) a.push('--csv');
+    if(checked('open')) a.push('--open');
+    run(a);
+  }
+  function addFeed(){
+    const u = val('feedurl').trim(); if(!u){ append('\n[warn] Enter a feed URL first.\n'); return; }
+    run(['feeds','add', u]);
+  }
+  function removeFeed(){
+    const i = val('rmindex'); if(!i){ append('\n[warn] Enter a 1-based index.\n'); return; }
+    run(['feeds','remove','--index', String(i)]);
+  }
+</script>
+</body>
+</html>
+"""
+    return html.replace("__TITLE__", title)
+
+
+def _offline_html(title: str) -> str:
+    """A static, serverless page explaining offline mode with the **same UI**.
+    Buttons remain clickable; clicking shows a toast with the equivalent CLI and
+    offers a copy-to-clipboard shortcut.
+    """
+    h = r"""
+<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\"/>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+<title>__TITLE__ (Offline)</title>
+<style>
+  :root { --bg:#0b0e14; --fg:#ebedf0; --muted:#a0a8b0; --card:#121622; --accent:#6ea8fe; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; }
+  .wrap { display:flex; flex-direction:column; height:100%; }
+  header { padding:12px 16px; background:var(--card); border-bottom:1px solid #222738; }
+  header h1 { margin:0; font-size:18px; letter-spacing:.3px; }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:12px; padding:12px; height:100%; box-sizing:border-box; }
+  .panel { background:var(--card); border:1px solid #222738; border-radius:12px; padding:12px; }
+  .grp { margin-bottom:14px; }
+  .grp h3 { margin:0 0 8px 0; font-size:14px; color:var(--muted); font-weight:600; }
+  label { display:inline-block; width:90px; color:var(--muted); font-size:12px; }
+  input,select { background:#0f1422; color:var(--fg); border:1px solid #2a3147; border-radius:8px; padding:6px 8px; margin:2px 0; font-size:13px; }
+  .btn { background:#11182a; color:var(--fg); border:1px solid #2a3147; border-radius:10px; padding:8px 10px; margin:4px 4px 4px 0; font-size:13px; cursor:pointer; }
+  .btn.primary { background:#1a2540; border-color:#38518a; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0a0d16; border:1px solid #222738; height:calc(100vh - 170px); border-radius:12px; padding:10px; overflow:auto; white-space:pre-wrap; }
+  .row { display:flex; align-items:center; gap:8px; margin:4px 0; }
+  /* toast */
+  #toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#121622; border:1px solid #2a3147; border-radius:12px; padding:12px; max-width:90vw; box-shadow:0 6px 20px rgba(0,0,0,.35); display:none; }
+  #toast pre { margin:0; }
+  #toast .actions { display:flex; gap:8px; margin-top:8px; justify-content:flex-end; }
+</style>
+</head>
+<body>
+<div class=\"wrap\">
+  <header>
+    <h1>__TITLE__ â€” Offline Mode</h1>
+    <div style=\"color:var(--muted); font-size:12px; margin-top:4px;\">Networking is disabled here. Click any button to get the exact CLI and copy it.</div>
+  </header>
+  <main>
+    <section class=\"panel\">
+      <div class=\"grp\"><h3>Parameters</h3>
+        <div class=\"row\"><label>Date</label><input id=\"date\" value=\"latest\"/></div>
+        <div class=\"row\"><label>Idx</label><input id=\"idx\" type=\"number\" value=\"1\"/></div>
+        <div class=\"row\"><label>Top</label><input id=\"top\" type=\"number\" value=\"3\"/></div>
+        <div class=\"row\"><label>Indices</label><input id=\"indices\" placeholder=\"e.g. 1,3,5\"/></div>
+        <div class=\"row\"><label>ID</label><input id=\"topic_id\" value=\"auto\"/></div>
+        <div class=\"row\"><label>Seed</label><input id=\"seed\" type=\"number\" value=\"12345\"/></div>
+        <div class=\"row\"><label>Lang</label><input id=\"lang\" value=\"en,hi\"/></div>
+        <div class=\"row\"><label>Aspect</label>
+          <select id=\"aspect\">
+            <option value=\"all\" selected>all</option>
+            <option value=\"4x5\">4x5</option>
+            <option value=\"1x1\">1x1</option>
+            <option value=\"9x16\">9x16</option>
+          </select>
+        </div>
+        <div class=\"row\"><label>Image</label>
+          <select id=\"image\">
+            <option value=\"\">(auto)</option>
+            <option value=\"4x5\">4x5</option>
+            <option value=\"1x1\">1x1</option>
+            <option value=\"9x16\">9x16</option>
+          </select>
+        </div>
+        <div class=\"row\"><label>Platform</label>
+          <select id=\"platform\">
+            <option value=\"\">(none)</option>
+            <option>instagram</option>
+            <option>instagram-stories</option>
+            <option>shorts</option>
+            <option>x</option>
+            <option>twitter</option>
+            <option>linkedin</option>
+            <option>facebook</option>
+          </select>
+        </div>
+        <div class=\"row\"><label></label>
+          <label><input type=\"checkbox\" id=\"skip_image\"/> skip image</label>
+          <label><input type=\"checkbox\" id=\"package\"/> package</label>
+          <label><input type=\"checkbox\" id=\"saveas\" checked/> saveas</label>
+          <label><input type=\"checkbox\" id=\"csv\" checked/> csv</label>
+          <label><input type=\"checkbox\" id=\"open\"/> open</label>
+        </div>
+      </div>
+
+      <div class=\"grp\"><h3>Pipeline</h3>
+        <button class=\"btn\" onclick=\"quick()\">Quick</button>
+        <button class=\"btn\" onclick=\"batch()\">Batch</button>
+        <button class=\"btn\" onclick=\"layout()\">Layout</button>
+        <button class=\"btn\" onclick=\"emit(['doctor','--strict'])\">Doctor</button>
+        <button class=\"btn\" onclick=\"emit(['research','--date', val('date')])\">Research</button>
+        <button class=\"btn\" onclick=\"emit(['triage','--date', val('date')])\">Triage</button>
+        <button class=\"btn\" onclick=\"emit(['thumbs','--date', val('date')])\">Thumbs</button>
+        <button class=\"btn\" onclick=\"emit(['socialcsv','--date', val('date')])\">SocialCSV</button>
+        <button class=\"btn\" onclick=\"emit(['seeds','--date', val('date')])\">Seeds</button>
+      </div>
+
+      <div class=\"grp\"><h3>Publish</h3>
+        <button class=\"btn primary\" onclick=\"publishNow()\">Publish</button>
+      </div>
+
+      <div class=\"grp\"><h3>Feeds</h3>
+        <button class=\"btn\" onclick=\"emit(['feeds','list'])\">List</button>
+        <div class=\"row\"><label>New feed</label><input id=\"feedurl\" placeholder=\"https://.../feed\" style=\"width:200px\"/> <button class=\"btn\" onclick=\"addFeed()\">Add</button></div>
+        <div class=\"row\"><label>Remove #</label><input id=\"rmindex\" type=\"number\" min=\"1\" style=\"width:100px\"/> <button class=\"btn\" onclick=\"removeFeed()\">Remove</button></div>
+        <button class=\"btn\" onclick=\"emit(['feeds','reset'])\">Reset (backup/defaults)</button>
+      </div>
+    </section>
+
+    <section class=\"panel\">
+      <div class=\"grp\"><h3>Output</h3>
+        <pre id=\"log\">Offline mode: this environment does not allow starting a webserver. Use the suggested CLI below.</pre>
+      </div>
+    </section>
+  </main>
+</div>
+<div id=\"toast\">
+  <pre id=\"toastText\"></pre>
+  <div class=\"actions\">
+    <button class=\"btn\" onclick=\"copyToast()\">Copy</button>
+    <button class=\"btn\" onclick=\"hideToast()\">Close</button>
+  </div>
+</div>
+<script>
+  function val(id){ return document.getElementById(id).value; }
+  function checked(id){ return document.getElementById(id).checked; }
+  const _qsParam = new URLSearchParams(location.search).get('autoclose');
+  const TOAST_TIMEOUT_MS = _qsParam !== null ? Math.max(0, Number(_qsParam)) : 4000;
+  let _toastTimer = null;
+  function cli(args){ return 'python -m satyagrah ' + args.join(' '); }
+  function showToast(s){
+    document.getElementById('toastText').textContent = s + '
+
+(offline mode: run this in PowerShell)';
+    const t = document.getElementById('toast');
+    t.style.display = 'block';
+    if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+    if (TOAST_TIMEOUT_MS > 0) {
+      _toastTimer = setTimeout(() => { hideToast(); _toastTimer = null; }, TOAST_TIMEOUT_MS);
+    }
+  }
+  function hideToast(){ document.getElementById('toast').style.display='none'; }
+  async function copyToast(){
+    const s = document.getElementById('toastText').textContent;
+    try { await navigator.clipboard.writeText(s); } catch(e){}
+  }
+  function emit(args){ showToast(cli(args)); }
+  function quick(){
+    const a = ['quick','--date', val('date'),'--idx', String(val('idx')),'--seed', String(val('seed'))];
+    const lang = val('lang'); if(lang) a.push('--lang', lang);
+    const aspect = val('aspect'); if(aspect && aspect !== 'all') a.push('--aspect', aspect);
+    if(checked('skip_image')) a.push('--skip_image');
+    if(checked('package')) a.push('--package');
+    if(checked('saveas')) a.push('--saveas');
+    const tid = val('topic_id'); if(tid && tid !== 'auto') a.push('--id', tid);
+    emit(a);
+  }
+  function batch(){
+    const a = ['batch','--date', val('date'),'--seed', String(val('seed'))];
+    const raw = val('indices').trim();
+    if(raw){ a.push('--indices', raw); } else { a.push('--top', String(val('top'))); }
+    const lang = val('lang'); if(lang) a.push('--lang', lang);
+    const aspect = val('aspect'); if(aspect && aspect !== 'all') a.push('--aspect', aspect);
+    if(checked('skip_image')) a.push('--skip_image');
+    if(checked('package')) a.push('--package');
+    if(checked('saveas')) a.push('--saveas');
+    emit(a);
+  }
+  function layout(){
+    const a = ['layout','--date', val('date'),'--id', val('topic_id')||'auto'];
+    const aspect = val('aspect'); if(aspect && aspect !== 'all') a.push('--aspect', aspect);
+    emit(a);
+  }
+  function publishNow(){
+    const a = ['publish','--date', val('date'),'--id', val('topic_id')||'auto','--lang', (val('lang')||'en')];
+    const img = val('image'); if(img) a.push('--image', img);
+    const plat = val('platform'); if(plat) a.push('--platform', plat);
+    if(checked('csv')) a.push('--csv');
+    if(checked('open')) a.push('--open');
+    emit(a);
+  }
+  function addFeed(){
+    const u = val('feedurl').trim(); if(!u){ emit(['echo','Enter a feed URL first']); return; }
+    emit(['feeds','add', u]);
+  }
+  function removeFeed(){
+    const i = val('rmindex'); if(!i){ emit(['echo','Enter a 1-based index']); return; }
+    emit(['feeds','remove','--index', String(i)]);
+  }
+</script>
+</body>
+</html>
+"""
+    return h.replace("__TITLE__", title)
+
+# ---------------------------- FastAPI app factory (lazy import) ----------------------------
+
+def create_fastapi_app():
+    """
+    Try to import FastAPI & build the app. Return (app, error) where error is None on success.
+    On environments without `ssl`, importing FastAPI may raise ModuleNotFoundError('ssl').
+    """
+    try:
+        from fastapi import FastAPI, Request, Body
+        from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, PlainTextResponse
+    except Exception as e:  # ImportError, ModuleNotFoundError('ssl'), etc.
+        return None, e
+
+    app = FastAPI(title=APP_TITLE)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def home():
+        return _home_html(APP_TITLE)
+
+    @app.post("/api/run")
+    async def api_run(payload: dict = Body(default={})):
+        """
+        Accept JSON like:
+          {"args": ["doctor","--strict"]}
+          {"cmd": ["doctor","--strict"]}
+          {"command": "doctor --strict"}
+        Streams the CLI output as text/plain.
+        """
+        import shlex
+        data = payload or {}
+        args = data.get("args") or data.get("cmd") or data.get("command") or []
+        if isinstance(args, str):
+            args = shlex.split(args)
+        if not isinstance(args, list) or not args:
+            return JSONResponse({"ok": False, "error": "missing 'cmd' (list) or 'command' (string)"}, status_code=400)
+        return StreamingResponse(stream_process_async(args), media_type="text/plain; charset=utf-8")
+
+    @app.get("/api/doctorjson")
+    async def api_doctor_json():
+        py = which_python()
+        cmd = [py, "-m", "satyagrah", "doctor", "--json"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=str(ROOT),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+            if proc.returncode not in (0, 2):
+                return PlainTextResponse((err or out or b"error").decode("utf-8", errors="ignore"), status_code=500)
+            data = json.loads(out.decode("utf-8", errors="ignore") or "[]")
+            return JSONResponse(data)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    return app, None
+# ---------------------------- Fallback server (stdlib only) ----------------------------
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "SatyFallback/1.1"
+
+    def _send(self, code: int, ctype: str, body: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/" or self.path.startswith("/index.html"):
+            html = _home_html(APP_TITLE).encode("utf-8")
+            self._send(200, "text/html; charset=utf-8", html)
+            return
+        if self.path == "/api/doctorjson":
+            rc, out = run_process_blocking(["doctor", "--json"])  # doctor may exit 0/2
+            try:
+                data = json.loads(out)
+                body = json.dumps(data).encode("utf-8")
+                self._send(200, "application/json; charset=utf-8", body)
+            except Exception:
+                # If not JSON, return text
+                self._send(200 if rc in (0, 2) else 500, "text/plain; charset=utf-8", out.encode("utf-8"))
+            return
+        self._send(404, "text/plain; charset=utf-8", b"Not found")
+
+    def do_POST(self):  # noqa: N802
+        if self.path == "/api/run":
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(n) if n > 0 else b"{}"
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                self._send(400, "application/json; charset=utf-8", b'{"error":"invalid json"}')
+                return
+            args = payload.get("args") or []
+            if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
+                self._send(400, "application/json; charset=utf-8", b'{"error":"args must be a list of strings"}')
+                return
+            rc, out = run_process_blocking(args)
+            code = 200 if rc == 0 else 200  # Return 200 with exit code marker in body to simplify client
+            self._send(code, "text/plain; charset=utf-8", out.encode("utf-8"))
+            return
+        self._send(404, "text/plain; charset=utf-8", b"Not found")
+
+
+def run_fallback_server(host: str, port: int) -> None:
+    """Run stdlib HTTP server. If binding is not supported (errno 138, EPERM, etc.),
+    raise OSError to allow the caller to switch to offline mode.
+    """
+    try:
+        httpd = ThreadingHTTPServer((host, port), _Handler)
+    except OSError as e:
+        # Propagate to main(). We'll decide offline there.
+        raise e
+    sa = httpd.socket.getsockname()
+    print(f"Fallback server on http://{sa[0]}:{sa[1]}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+# ---------------------------- Offline writer ----------------------------
+
+def write_offline_page(out_path: Path) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    html = _offline_html(APP_TITLE)
+    out_path.write_text(html, encoding="utf-8")
+    return out_path
+
+# ---------------------------- tests ----------------------------
+
+def _selftest() -> int:
+    import unittest
+    import tempfile
+
+    class Tests(unittest.TestCase):
+        def test_home_contains_title(self):
+            html = _home_html(APP_TITLE)
+            self.assertIn(APP_TITLE, html)
+            self.assertIn("function val(id)", html)
+            self.assertIn("<title", html)
+
+        def test_no_brace_parse_errors(self):
+            # Ensure building the HTML doesn't require escaping braces
+            try:
+                html = _home_html(APP_TITLE)
+            except Exception as e:
+                self.fail(f"HTML builder raised exception: {e}")
+            self.assertGreater(len(html), 1000)
+
+        def test_which_python(self):
+            self.assertTrue(which_python())
+
+        def test_offline_writer(self):
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "offline.html"
+                out = write_offline_page(p)
+                self.assertTrue(out.exists())
+                t = out.read_text(encoding="utf-8")
+                self.assertIn("Offline Mode", t)
+                self.assertIn(APP_TITLE, t)
+
+        def test_offline_autoclose_default(self):
+            # The offline HTML should mention the default 4000ms timeout (auto-dismiss)
+            t = _offline_html(APP_TITLE)
+            self.assertIn("autoclose", t)
+            self.assertIn("4000", t)
+
+        def test_safe_exit(self):
+            # 0 should not raise; non-zero should raise
+            _safe_exit(0)  # no exception
+            with self.assertRaises(SystemExit):
+                _safe_exit(2)
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+# ---------------------------- CLI entry ----------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=APP_TITLE)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--reload", action="store_true", help="Auto-reload on code changes (FastAPI only)")
+    parser.add_argument("--selftest", action="store_true", help="Run built-in tests and exit")
+    parser.add_argument("--force-fallback", action="store_true", help="Force stdlib server (ignore FastAPI)")
+    parser.add_argument("--offline", action="store_true", help="Write offline HTML and exit (no server)")
+    parser.add_argument("--offline-out", default="saty_offline.html", help="Offline HTML path")
+    args = parser.parse_args(argv if argv is not None else None)
+
+    if args.selftest:
+        return _selftest()
+
+    if args.offline:
+        out = write_offline_page(Path(args.offline_out))
+        print(f"Offline page written -> {out}")
+        return 0
+
+    # Try FastAPI first unless forced fallback
+    if not args.force_fallback:
+        app, err = create_fastapi_app()
+        if app is not None:
+            try:
+                import uvicorn  # type: ignore
+                print(f"Root: {ROOT}")
+                uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
+                return 0
+            except Exception as e:
+                print(f"FastAPI/Uvicorn unavailable or failed ({e}); trying fallback server...")
+        else:
+            print(f"FastAPI unavailable ({err}); trying fallback server...")
+
+    # Fallback server; if bind fails (e.g., sandbox), write offline page
+    try:
+        run_fallback_server(args.host, args.port)
+        return 0
+    except OSError as e:
+        # Common in sandboxes: errno 138 (Not supported), EPERM, EACCES
+        if getattr(e, 'errno', None) in {138, errno.EPERM, errno.EACCES} or 'Not supported' in str(e):
+            out = write_offline_page(Path(args.offline_out))
+            print(f"Networking not permitted here ({e}). Offline page -> {out}")
+            return 0
+        raise
+
+
+def _safe_exit(code) -> None:
+    """Exit semantics that avoid raising SystemExit on success.
+    Some sandboxes treat `SystemExit(0)` as an error; only raise for non-zero codes.
+    Also print a tiny 'Done.' on success so it's not silent.
+    """
+    try:
+        icode = 0 if code is None else int(code)
+    except Exception:
+        icode = 1
+    if icode != 0:
+        raise SystemExit(icode)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    _safe_exit(main())
+
+
+
+
+
+
+
+

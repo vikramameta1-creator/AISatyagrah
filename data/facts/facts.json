@@ -1,0 +1,35 @@
+{
+  "topics": [
+    {
+      "id": "t1",
+      "title": "Sample Topic",
+      "summary": "Short neutral summary for testing.",
+      "sources": [
+        "https://example.org/source1"
+      ],
+      "tags": [
+        "india",
+        "politics",
+        "satire"
+      ]
+    },
+    {
+      "id": "f6a8132c8bba",
+      "title": "Topic f6a8132c8bba",
+      "summary": "Auto-added from shortlist.",
+      "tags": []
+    },
+    {
+      "id": "bcef1d3dc0c2",
+      "title": "Topic bcef1d3dc0c2",
+      "summary": "Auto-added from shortlist.",
+      "tags": []
+    },
+    {
+      "id": "4bba29834d9d",
+      "title": "Topic 4bba29834d9d",
+      "summary": "Auto-added from shortlist.",
+      "tags": []
+    }
+  ]
+}
