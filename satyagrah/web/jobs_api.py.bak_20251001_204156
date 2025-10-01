@@ -1,0 +1,514 @@
+﻿from __future__ import annotations
+
+import os
+import json
+import datetime as _dt
+from pathlib import Path
+from typing import Optional, Any, Dict, List
+
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# project bits
+from ..models.db import ensure_db, list_jobs, list_results
+from ..services.worker import enqueue_export_job, run_worker_once
+
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[2]
+DB_PATH = ROOT / "state.db"
+EXPORTS = ROOT / "exports"
+DATAROOT = ROOT / "data"
+
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+
+# ---------------------------------------------------------------------------
+
+def _today() -> str:
+    return _dt.date.today().isoformat()
+
+def _auth_guard(x_auth: Optional[str]) -> None:
+    """If AUTH_TOKEN is set, require the same value in X-Auth header."""
+    if not AUTH_TOKEN:
+        return
+    if not x_auth or x_auth != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+def _image_dir(date: str) -> Path:
+    return DATAROOT / "runs" / date / "art"
+
+def _images_for_date(date: str) -> List[Path]:
+    d = _image_dir(date)
+    if not d.exists():
+        return []
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    return sorted([p for p in d.iterdir() if p.is_file() and p.suffix.lower() in exts])
+
+# ---------------------------------------------------------------------------
+
+class ExportReq(BaseModel):
+    date: Optional[str] = None
+    args: Optional[Dict[str, Any]] = None
+    files: Optional[List[str]] = None  # gallery selection (web paths like /data/runs/<date>/art/xxx.png)
+
+app = FastAPI(title="AISatyagrah Jobs API")
+
+# serve exports and raw data (for gallery thumbnails)
+app.mount("/exports", StaticFiles(directory=str(EXPORTS)), name="exports")
+app.mount("/data", StaticFiles(directory=str(DATAROOT)), name="data")
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/jobs")
+def api_jobs(limit: int = 50,
+             status: Optional[str] = None,
+             date: Optional[str] = None,
+             x_auth: Optional[str] = Header(default=None)):
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    return list_jobs(DB_PATH, limit=limit, status=status, date=date)
+
+@app.get("/api/results")
+def api_results(limit: int = 100,
+                date: Optional[str] = None,
+                job_id: Optional[int] = None,
+                x_auth: Optional[str] = Header(default=None)):
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    return list_results(DB_PATH, limit=limit, date=date, job_id=job_id)
+
+@app.post("/api/export/{kind}")
+def api_export(kind: str, body: ExportReq, x_auth: Optional[str] = Header(default=None)):
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    date = body.date or _today()
+    payload: Dict[str, Any] = dict(body.args or {})
+    jid = enqueue_export_job(DB_PATH, kind=kind, date=date, payload=payload)
+    return {"queued": jid, "kind": kind, "date": date}
+
+@app.post("/api/export_selected/{kind}")
+def api_export_selected(kind: str, body: ExportReq, x_auth: Optional[str] = Header(default=None)):
+    """
+    Enqueue export for a specific ordered file list (web paths from the gallery).
+    Payload is preserved so exporters can honor selection order.
+    """
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    date = body.date or _today()
+    payload: Dict[str, Any] = {"files": body.files or []}
+    if body.args:
+        payload.update({"args": body.args})
+    jid = enqueue_export_job(DB_PATH, kind=kind, date=date, payload=payload)
+    return {"queued": jid, "kind": kind, "date": date, "count": len(payload["files"])}
+
+@app.post("/api/worker/tick")
+def api_worker_tick(x_auth: Optional[str] = Header(default=None)):
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    code = run_worker_once(DB_PATH, EXPORTS)
+    return {"ok": (code == 0)}
+
+@app.post("/api/worker/drain")
+def api_worker_drain(max_loops: int = 50, x_auth: Optional[str] = Header(default=None)):
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    iters = 0
+    while iters < max_loops:
+        q = list_jobs(DB_PATH, limit=1, status="queued")
+        r = list_jobs(DB_PATH, limit=1, status="running")
+        if not q and not r:
+            break
+        run_worker_once(DB_PATH, EXPORTS)
+        iters += 1
+    remaining = len(list_jobs(DB_PATH, limit=1000, status="queued"))
+    return {"ok": True, "iterations": iters, "remaining": remaining}
+
+@app.post("/api/queue/all")
+def api_queue_all(body: ExportReq, x_auth: Optional[str] = Header(default=None)):
+    """Queue all exporters for a given date."""
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    date = body.date or _today()
+    kinds = ("pdf", "csv", "pptx", "gif", "mp4", "zip")
+    queued = [enqueue_export_job(DB_PATH, kind=k, date=date, payload=(body.args or {})) for k in kinds]
+    return {"ok": True, "date": date, "queued": queued}
+
+@app.post("/api/sample")
+def api_sample(body: ExportReq | None = None, x_auth: Optional[str] = Header(default=None)):
+    """Create a tiny sample image for today's date and queue all exporters."""
+    _auth_guard(x_auth)
+    ensure_db(DB_PATH)
+    date = (body.date if body else None) or _today()
+
+    artdir = _image_dir(date)
+    artdir.mkdir(parents=True, exist_ok=True)
+    img = artdir / "sample.png"
+
+    # draw a simple image; if PIL isn't there, fall back to stub file
+    try:
+        from PIL import Image, ImageDraw
+        im = Image.new("RGB", (1280, 720), (20, 20, 20))
+        d = ImageDraw.Draw(im)
+        d.text((40, 40), f"AISatyagrah sample — {date}", fill=(240, 240, 240))
+        im.save(img)
+    except Exception:
+        img.write_bytes(b"sample")
+
+    kinds = ("pdf", "csv", "pptx", "gif", "mp4", "zip")
+    queued = [enqueue_export_job(DB_PATH, kind=k, date=date, payload={}) for k in kinds]
+    return {"ok": True, "date": date, "image": str(img), "queued": queued}
+
+@app.get("/api/images")
+def api_images(date: Optional[str] = None, x_auth: Optional[str] = Header(default=None)):
+    """List images for the gallery (with web paths that resolve under /data)."""
+    _auth_guard(x_auth)
+    date = date or _today()
+    imgs = []
+    for p in _images_for_date(date):
+        try:
+            rel = p.relative_to(DATAROOT).as_posix()
+            web = f"/data/{rel}"
+        except Exception:
+            web = p.name
+        imgs.append({
+            "name": p.name,
+            "path": str(p),
+            "web": web,
+            "size": p.stat().st_size,
+            "mtime": p.stat().st_mtime,
+        })
+    return imgs
+
+@app.post("/api/results_zip")
+def api_results_zip(body: ExportReq, x_auth: Optional[str] = Header(default=None)):
+    """Build /exports/<date>/results_bundle.zip of all files in that folder."""
+    from zipfile import ZipFile, ZIP_DEFLATED
+    _auth_guard(x_auth)
+    date = body.date or _today()
+    folder = EXPORTS / date
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / "results_bundle.zip"
+    try:
+        if out.exists():
+            out.unlink()
+        with ZipFile(out, "w", ZIP_DEFLATED) as z:
+            for p in sorted(folder.glob("*")):
+                if p.is_file() and p.name != out.name:
+                    z.write(p, arcname=p.name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bundle failed: {e}")
+    return {"ok": True, "path": f"/exports/{date}/results_bundle.zip"}
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return f"""<!doctype html>
+<html lang='en'><meta charset='utf-8'/>
+<title>AISatyagrah — Export Queue</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root{{color-scheme:dark light}}
+*{{box-sizing:border-box}}
+body{{margin:22px;background:#111;color:#eee;font:14px/1.45 system-ui,Segoe UI,Roboto,Arial}}
+h1{{font-size:22px;margin:0 0 14px}}
+.row{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}}
+input,button,select{{padding:8px 10px;border-radius:10px;border:1px solid #333;background:#222;color:#eee}}
+button{{cursor:pointer}}
+table{{border-collapse:collapse;width:100%;margin-top:12px}}
+th,td{{border-bottom:1px solid #333;padding:8px;text-align:left;font-variant-numeric:tabular-nums}}
+a{{color:#7ecbff;text-decoration:none}}
+.kbd{{font:12px monospace;background:#222;border:1px solid #333;border-radius:6px;padding:2px 6px}}
+#toasts{{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:9}}
+.toast{{background:#222;border:1px solid #333;border-radius:10px;padding:10px 12px;box-shadow:0 4px 12px rgb(0 0 0 / .4)}}
+.toast.ok{{border-color:#2e7d32}}
+.toast.err{{border-color:#c62828}}
+.gallery{{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin-top:8px}}
+.thumb{{border:1px solid #333;border-radius:12px;overflow:hidden;position:relative;cursor:pointer;background:#1b1b1b;min-height:180px;display:flex;align-items:center;justify-content:center}}
+.thumb img{{max-width:100%;max-height:260px;display:block}}
+.pick{{position:absolute;left:8px;top:8px;background:#0009;border:1px solid #555;border-radius:999px;padding:4px 10px}}
+.selected .thumb{{
+  outline:2px solid #7ecbff;
+}}
+.controls{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px}}
+h3{{margin:22px 0 10px}}
+.small{{opacity:.85}}
+.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
+.badge{{display:inline-block;background:#222;border:1px solid #333;padding:4px 8px;border-radius:999px}}
+</style>
+<body>
+<h1>AISatyagrah — Export Queue</h1>
+
+<div class="row">
+  <label>Date <input id="date" type="date"></label>
+  <button onclick="queue('pdf')">Queue PDF</button>
+  <button onclick="queue('csv')">Queue CSV</button>
+  <button onclick="queue('pptx')">Queue PPTX</button>
+  <button onclick="queue('gif')">Queue GIF</button>
+  <button onclick="queue('mp4')">Queue MP4</button>
+  <button onclick="queue('zip')">Queue ZIP</button>
+  <button onclick="queueAll()">Queue All</button>
+  <button onclick="tick()">Worker Tick</button>
+  <button onclick="retryFailed()">Retry Failed</button>
+  <button onclick="drain()">Drain Queue</button>
+  <button onclick="sample()">Make Sample Run</button>
+  <button onclick="downloadZip()">Download Results ZIP</button>
+  <button onclick="setToken()">Set Token</button>
+</div>
+
+<h3>Jobs</h3>
+<table id="jobs"><thead><tr>
+  <th>id</th><th>date</th><th>kind</th><th>status</th><th>created</th><th>finished</th><th>error</th>
+</tr></thead><tbody></tbody></table>
+
+<h3>Results (today)</h3>
+<table id="results"><thead><tr>
+  <th>id</th><th>job_id</th><th>kind</th><th>file</th><th>size</th><th>created</th>
+</tr></thead><tbody></tbody></table>
+
+<h3>Gallery (today)</h3>
+<div class="controls">
+  <button onclick="selectAll()">Select All</button>
+  <button onclick="clearSel()">Clear</button>
+  <span>| Export selected →</span>
+  <label>MP4 fps <input id="mp4fps" type="number" step="0.1" min="0.2" value="1.8" style="width:80px"></label>
+  <label>GIF ms/frame <input id="gifms" type="number" step="1" min="10" value="110" style="width:90px"></label>
+  <button onclick="exportSel('pdf')">PDF</button>
+  <button onclick="exportSel('pptx')">PPTX</button>
+  <button onclick="exportSel('gif')">GIF</button>
+  <button onclick="exportSel('mp4')">MP4</button>
+  <button onclick="exportSel('csv')">CSV</button>
+  <button onclick="exportSel('zip')">ZIP</button>
+</div>
+<div id="gallery" class="gallery"></div>
+
+<div class="grid2" style="margin-top:20px">
+  <div>
+    <h3>Selection (drag to reorder)</h3>
+    <div id="sel" class="gallery"></div>
+  </div>
+  <div>
+    <h3>Captions</h3>
+    <div class="small badge" id="selname">(none)</div>
+    <div style="margin-top:8px">
+      <div>Caption</div>
+      <textarea id="captext" style="width:100%;height:160px;background:#181818;color:#eee;border:1px solid #333;border-radius:12px;padding:10px"></textarea>
+      <div style="margin-top:8px">Hashtags</div>
+      <input id="tags" placeholder="#tag1 #tag2" style="width:100%;background:#181818;color:#eee;border:1px solid #333;border-radius:12px;padding:8px">
+      <div class="row" style="margin-top:10px">
+        <button onclick="saveCaption()">Save Caption</button>
+        <button onclick="clearCaption()">Clear for this image</button>
+      </div>
+      <div class="small" id="capinfo">Saved to: data/runs/&lt;date&gt;/captions.json</div>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+const API = location.origin;
+
+// ---------- auth -------------
+function setToken(){
+  const t = prompt("Auth token (empty = disable):", localStorage.getItem("saty_token")||"");
+  if (t !== null){
+    localStorage.setItem("saty_token", t.trim());
+    toast("Token updated");
+  }
+}
+function authHdr(){
+  const t = localStorage.getItem("saty_token")||"";
+  return t ? {"x-auth": t} : {};
+}
+
+// ---------- utils -------------
+function toast(msg, ok=true){
+  const wrap = document.getElementById('toasts');
+  const div = document.createElement('div');
+  div.className = 'toast ' + (ok ? 'ok' : 'err');
+  div.textContent = msg;
+  wrap.appendChild(div);
+  setTimeout(()=>div.remove(), 2200);
+}
+function todayStr(){
+  const d = new Date(), z = d.getTimezoneOffset()*60000;
+  return (new Date(Date.now()-z)).toISOString().slice(0,10);
+}
+function el(tag, attrs={}, ...kids){
+  const n = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs)) (k==='class')? n.className=v : n.setAttribute(k,v);
+  for (const k of kids) n.append(k);
+  return n;
+}
+async function fetchJSON(url, opts={}){
+  const r = await fetch(url, {
+    headers: Object.assign({"Content-Type":"application/json"}, authHdr(), (opts.headers||{})),
+    ...opts
+  });
+  if (r.ok) return await r.json();
+  const t = await r.text();
+  throw new Error(t||r.statusText);
+}
+
+// ---------- jobs/results ----------
+async function refresh(){
+  const date = document.getElementById('date').value || todayStr();
+  try{
+    const jobs = await fetchJSON(`${API}/api/jobs?limit=50&date=${date}`);
+    const tb = document.querySelector('#jobs tbody'); tb.innerHTML='';
+    for (const r of jobs){
+      const tr = el('tr',{}, el('td',{},r.id), el('td',{},r.date||''), el('td',{},r.kind||''),
+        el('td',{},r.status||''), el('td',{},(r.created_at||'').slice(0,19)), el('td',{},(r.finished_at||'').slice(0,19)), el('td',{}, r.error?'err':'' ));
+      tb.append(tr);
+    }
+    const res = await fetchJSON(`${API}/api/results?date=${date}&limit=200`);
+    const rb = document.querySelector('#results tbody'); rb.innerHTML='';
+    for (const r of res){
+      const rel = (r.path||'').replace(/^.*\\\\exports\\\\/,'/exports/').replace(/^.*\\/exports\\//,'/exports/');
+      const tr = el('tr',{}, el('td',{},r.id), el('td',{},r.job_id), el('td',{},r.kind||''),
+        el('td',{}, el('a',{href:rel,target:'_blank'}, rel.split('/').pop()||'')), el('td',{}, (r.size||'')+''), el('td',{}, (r.created_at||'').slice(0,19)));
+      rb.append(tr);
+    }
+  }catch(e){ toast('Refresh failed', false); console.error(e); }
+}
+
+// ---------- queue/worker ----------
+async function queue(kind){
+  const date = document.getElementById('date').value || todayStr();
+  await fetchJSON(`${API}/api/export/${kind}`, {method:'POST', body: JSON.stringify({date})});
+  toast(`Queued ${kind.toUpperCase()}`); refresh();
+}
+async function queueAll(){
+  const date = document.getElementById('date').value || todayStr();
+  await fetchJSON(`${API}/api/queue/all`, {method:'POST', body: JSON.stringify({date})});
+  toast('Queued ALL'); refresh();
+}
+async function tick(){ const r = await fetchJSON(`${API}/api/worker/tick`, {method:'POST'}); toast(r.ok?'Worker tick ok':'Worker tick error', r.ok); refresh(); }
+async function drain(){ const r = await fetchJSON(`${API}/api/worker/drain`, {method:'POST'}); toast(`Drained ${r.iterations}, remaining ${r.remaining}`); refresh(); }
+async function retryFailed(){
+  // simple: re-queue anything with status=failed for the day
+  const date = document.getElementById('date').value || todayStr();
+  const jobs = await fetchJSON(`${API}/api/jobs?limit=200&status=failed&date=${date}`);
+  for (const j of jobs){
+    await fetchJSON(`${API}/api/export/${(j.kind||'').replace(/^export:/,'')}`, {method:'POST', body: JSON.stringify({date})});
+  }
+  toast(`Re-queued ${jobs.length} failed`);
+  refresh();
+}
+async function sample(){
+  const date = document.getElementById('date').value || todayStr();
+  await fetchJSON(`${API}/api/sample`, {method:'POST', body: JSON.stringify({date})});
+  toast(`Sample created + queued`); await drain(); await loadGallery();
+}
+async function downloadZip(){
+  const date = document.getElementById('date').value || todayStr();
+  const r = await fetchJSON(`${API}/api/results_zip`, {method:'POST', body: JSON.stringify({date})});
+  if (r.ok && r.path){ const a = document.createElement('a'); a.href=r.path; a.target='_blank'; a.click(); toast('ZIP ready'); }
+  else toast('ZIP failed', false);
+}
+
+// ---------- gallery / selection ----------
+let gallery = [], selection = [], captions = {};
+
+// load captions.json if present
+async function loadCaptions(){
+  const date = document.getElementById('date').value || todayStr();
+  try{
+    const url = `${API}/data/runs/${date}/captions.json`;
+    const r = await fetch(url, {headers: authHdr()});
+    if (!r.ok) { captions = {}; return; }
+    captions = await r.json();
+  }catch{ captions = {}; }
+}
+async function saveCaptionsFile(){
+  // we cannot write to disk from browser; captions are saved in CSV exporter step
+}
+
+function renderGallery(){
+  const g = document.getElementById('gallery'); g.innerHTML='';
+  for (const it of gallery){
+    const box = el('div',{class:'selected'*(selection.includes(it.web)?1:0)});
+    if (!selection.includes(it.web)) box.className = '';
+    const t = el('div',{class:'thumb'}, el('div',{class:'pick'}, 'pick'));
+    const im = new Image(); im.src = it.web; t.append(im);
+    t.onclick = ()=> togglePick(it.web);
+    box.append(t);
+    g.append(box);
+  }
+}
+function renderSelection(){
+  const s = document.getElementById('sel'); s.innerHTML='';
+  for (const w of selection){
+    const it = gallery.find(x=>x.web===w); if (!it) continue;
+    const box = el('div',{class:'thumb'}); const im = new Image(); im.src = it.web; box.append(im); s.append(box);
+  }
+  const current = selection[0];
+  document.getElementById('selname').textContent = current ? (current.split('/').pop()) : '(none)';
+  loadCaptionFields();
+}
+function togglePick(web){
+  const i = selection.indexOf(web);
+  if (i>=0) selection.splice(i,1); else selection.push(web);
+  renderGallery(); renderSelection();
+}
+function selectAll(){ selection = gallery.map(x=>x.web); renderGallery(); renderSelection(); }
+function clearSel(){ selection = []; renderGallery(); renderSelection(); }
+
+async function loadGallery(){
+  const date = document.getElementById('date').value || todayStr();
+  gallery = await fetchJSON(`${API}/api/images?date=${date}`);
+  await loadCaptions();
+  selection = [];
+  renderGallery(); renderSelection();
+}
+
+function loadCaptionFields(){
+  const current = selection[0];
+  if (!current){ document.getElementById('captext').value=''; document.getElementById('tags').value=''; return; }
+  const rec = captions[current] || {};
+  document.getElementById('captext').value = rec.caption || '';
+  document.getElementById('tags').value = (rec.hashtags||[]).join(' ');
+}
+function saveCaption(){
+  const current = selection[0]; if (!current){ toast('Pick an image first', false); return; }
+  const cap = document.getElementById('captext').value.trim();
+  const tags = document.getElementById('tags').value.trim().split(/\\s+/).filter(Boolean);
+  captions[current] = {caption: cap, hashtags: tags};
+  toast('Caption saved');
+}
+function clearCaption(){
+  const current = selection[0]; if (!current) return;
+  delete captions[current];
+  document.getElementById('captext').value = '';
+  document.getElementById('tags').value = '';
+  toast('Caption cleared');
+}
+
+async function exportSel(kind){
+  if (!selection.length){ toast('Pick some images first', false); return; }
+  const date = document.getElementById('date').value || todayStr();
+  const fps = parseFloat(document.getElementById('mp4fps').value)||1.0;
+  const gifms = parseInt(document.getElementById('gifms').value)||110;
+
+  // we embed captions in the CSV step; for other exporters, the worker can use payload.args if needed
+  const args = {fps: fps, gif_ms_per_frame: gifms, captions: captions};
+  const body = {date, files: selection, args};
+  const r = await fetchJSON(`${API}/api/export_selected/${kind}`, {method:'POST', body: JSON.stringify(body)});
+  toast(`Queued ${kind.toUpperCase()} for ${r.count||selection.length} images`);
+  refresh();
+}
+
+// ---------- init ----------
+(function init(){
+  const di = document.getElementById('date'); if(!di.value) di.value = todayStr();
+  refresh(); loadGallery();
+})();
+</script>
+</body></html>"""
