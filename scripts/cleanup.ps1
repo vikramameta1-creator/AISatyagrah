@@ -1,19 +1,44 @@
-param([int]$KeepDays = 14)
-$ErrorActionPreference = "Stop"
+# scripts/cleanup.ps1
+param(
+  [int]$KeepDays = 7
+)
+$ErrorActionPreference = 'Stop'
 
-$repo = Resolve-Path (Join-Path $PSScriptRoot "..")
-$exports = Join-Path $repo "exports"
-$cutoff = (Get-Date).AddDays(-$KeepDays)
+# move to repo root
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
 
-Get-ChildItem $exports -Directory |
-  Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.LastWriteTime -lt $cutoff } |
-  Remove-Item -Recurse -Force
+Write-Host "Root: $root"
 
-& "$repo\.venv\Scripts\Activate.ps1"
-python - << 'PY'
+# prune old exports (keep today and recent)
+$today = Get-Date -Format 'yyyy-MM-dd'
+$exports = Join-Path $root 'exports'
+if (Test-Path $exports) {
+  Get-ChildItem $exports -Directory |
+    Where-Object {
+      $_.Name -ne $today -and
+      ($_.LastWriteTime -lt (Get-Date).AddDays(-$KeepDays))
+    } |
+    ForEach-Object {
+      Write-Host "Deleting $($_.FullName)"
+      Remove-Item $_.FullName -Recurse -Force
+    }
+}
+
+# VACUUM sqlite DB (state.db)
+$code = @'
 import sqlite3, pathlib
 db = pathlib.Path("state.db")
 if db.exists():
-    con = sqlite3.connect(db); con.execute("VACUUM"); con.close()
-print("cleanup ok")
-PY
+    con = sqlite3.connect(db)
+    con.execute("VACUUM")
+    con.close()
+print("OK: vacuumed")
+'@
+
+$tmp = New-TemporaryFile
+Set-Content -Path $tmp -Value $code -Encoding UTF8
+python $tmp
+Remove-Item $tmp -Force
+
+Write-Host "Cleanup done."

@@ -1,5 +1,5 @@
 {
-  "uptime_sec": 636,
+  "uptime_sec": 327,
   "processed_today": 0,
   "queue_len": 0,
   "last_job_id": "",
@@ -8,8 +8,8 @@
   "share_percent": 50,
   "paused": false,
   "needs_attention": false,
-  "since_last_job_sec": 636,
-  "started_at": 1759288179,
+  "since_last_job_sec": 327,
+  "started_at": 1759306142,
   "inactivity_minutes": 120,
   "max_per_day": 5
 }
