@@ -1,38 +1,60 @@
 # satyagrah/services/worker.py
+from __future__ import annotations
+
 from pathlib import Path
 from ..models.db import enqueue_job, fetch_next_job, complete_job
 
+
+
 def enqueue_export_job(db_path: Path, *, kind: str, date: str, payload: dict) -> int:
-    # kind is one of: csv, pdf, pptx, gif, mp4, zip
+    # kind is one of: csv, pdf, pptx, gif, mp4, zip, pdfmeta, pptxmeta
     return enqueue_job(db_path, kind=f"export:{kind}", date=date, payload=payload)
+
 
 def _run_job(kind: str, date: str, exports_root: Path):
     if kind == "export:csv":
         from ..exports.csv_export import run as run_csv
         p = run_csv(date=date, exports_root=exports_root)
         return [(str(p), "csv", {})]
+
     elif kind == "export:pdf":
         from ..exports.pdf_export import run as run_pdf
         p = run_pdf(date=date, exports_root=exports_root)
         return [(str(p), "pdf", {})]
+
     elif kind == "export:pptx":
         from ..exports.pptx_export import run as run_pptx
         p = run_pptx(date=date, exports_root=exports_root)
         return [(str(p), "pptx", {})]
+
     elif kind == "export:gif":
         from ..exports.gif_export import run as run_gif
         p = run_gif(date=date, exports_root=exports_root)
         return [(str(p), "gif", {})]
+
     elif kind == "export:mp4":
         from ..exports.mp4_export import run as run_mp4
         p = run_mp4(date=date, exports_root=exports_root)
         return [(str(p), "mp4", {})]
+
     elif kind == "export:zip":
         from ..exports.zip_export import run as run_zip
         p = run_zip(date=date, exports_root=exports_root)
         return [(str(p), "zip", {})]
+
+    elif kind == "export:pdfmeta":
+        from ..exports.pdfmeta_export import run as run_pdfmeta
+        p = run_pdfmeta(date=date, exports_root=exports_root)
+        return [(str(p), "pdf", {})]
+
+    elif kind == "export:pptxmeta":
+        from ..exports.pptxmeta_export import run as run_pptxmeta
+        p = run_pptxmeta(date=date, exports_root=exports_root)
+        return [(str(p), "pptx", {})]
+
     else:
         raise RuntimeError(f"Unknown job kind: {kind}")
+
 
 def run_worker_once(db_path: Path, exports_root: Path) -> int:
     job = fetch_next_job(db_path)

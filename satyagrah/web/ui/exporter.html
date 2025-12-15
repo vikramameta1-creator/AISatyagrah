@@ -1,0 +1,105 @@
+﻿<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Exporter</title>
+  <style>
+    body { font-family: system-ui, Segoe UI, Arial; background:#0f1115; color:#eee; margin:18px; }
+    h1 { margin:0 0 14px 0; font-size:40px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+    input[type=text]{ width:360px; padding:8px 10px; border-radius:8px; border:1px solid #333; background:#161922; color:#ddd;}
+    button{ padding:10px 14px; border-radius:10px; border:1px solid #2a2f3a; background:#1c2230; color:#ddd; cursor:pointer }
+    button:hover{ background:#233047 }
+    pre { background:#0b0e14; border:1px solid #2a2f3a; border-radius:12px; padding:14px; min-height:220px; overflow:auto;}
+    small{opacity:.7}
+  </style>
+</head>
+<body>
+  <h1>Exporter</h1>
+
+  <div class="row">
+    <span>Token:</span>
+    <input id="tok" type="text" placeholder="x-auth token"/>
+    <button onclick="saveTok()">Save</button>
+    <small>(stored in localStorage)</small>
+  </div>
+
+  <div class="row">
+    <button onclick="exportAll(false)">Export All (in-process)</button>
+    <button onclick="exportAll(true)">Export All (Job via Redis)</button>
+    <input id="jid" type="text" placeholder="job id"/>
+    <button onclick="watchJob()">Stream (SSE)</button>
+    <button onclick="cancelJob()">Cancel Job</button>
+  </div>
+
+  <div class="row">
+    <button onclick="listFiles()">List Latest Files</button>
+    <button onclick="cleanup()">Cleanup Files ≥60d</button>
+    <button onclick="cfg()">Show Config</button>
+    <button onclick="metrics()">Metrics</button>
+  </div>
+
+  <pre id="out">{\n  "ok": true,\n  "msg": "ready"\n}</pre>
+
+<script>
+const base = location.origin;
+const out  = document.getElementById('out');
+const tokI = document.getElementById('tok');
+tokI.value = localStorage.getItem('xauth') || '';
+
+function saveTok(){
+  localStorage.setItem('xauth', tokI.value.trim());
+  write({ok:true, saved:true});
+}
+
+function hdr(){ return { 'x-auth': (localStorage.getItem('xauth')||'').trim(), 'content-type':'application/json' }; }
+function write(obj){ out.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2); }
+
+async function exportAll(useRedis){
+  const r = await fetch(`${base}/api/export/all`, { method:'POST', headers:hdr(), body: JSON.stringify({use_redis: !!useRedis}) });
+  write(await r.json());
+}
+
+async function listFiles(){
+  const r = await fetch(`${base}/api/files?limit=10&offset=0`, { headers: hdr() });
+  write(await r.json());
+}
+
+async function cleanup(){
+  const r = await fetch(`${base}/api/files/cleanup?older_than_days=60`, { method:'POST', headers: hdr() });
+  write(await r.json());
+}
+
+async function cfg(){
+  const r = await fetch(`${base}/api/config`, { headers: hdr() });
+  write(await r.json());
+}
+
+async function metrics(){
+  const r = await fetch(`${base}/metrics`);
+  write(await r.text());
+}
+
+function watchJob(){
+  const jid = document.getElementById('jid').value.trim();
+  if(!jid){ write({ok:false, error:"no job id"}); return; }
+  write("⏳ connecting to SSE…\n");
+  const token = (localStorage.getItem('xauth')||'').trim();
+  const url = `${base}/api/jobs/${encodeURIComponent(jid)}/events?x-auth=${encodeURIComponent(token)}`;
+  const es  = new EventSource(url);
+  es.onmessage = e => {
+    out.textContent += e.data + "\n";
+    out.scrollTop = out.scrollHeight;
+  };
+  es.onerror = e => { out.textContent += "[SSE closed]\n"; es.close(); };
+}
+
+async function cancelJob(){
+  const jid = document.getElementById('jid').value.trim();
+  if(!jid){ write({ok:false, error:"no job id"}); return; }
+  const r = await fetch(`${base}/api/jobs/${encodeURIComponent(jid)}`, { method:'DELETE', headers: hdr() });
+  write(await r.json());
+}
+</script>
+</body>
+</html>

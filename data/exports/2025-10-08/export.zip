@@ -1,0 +1,8 @@
+kind: zip
+date: 2025-10-08
+created: 2025-10-08T20:16:09.626285
+fps: 1.8
+gif_ms_per_frame: 110
+files:
+  - sample.jpg
+  - sample.png

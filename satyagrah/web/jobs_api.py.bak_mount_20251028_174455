@@ -1,0 +1,216 @@
+﻿from __future__ import annotations
+
+import os, time, json
+from pathlib import Path
+from typing import Iterable
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+# ---------- basic paths ----------
+ROOT = Path(os.getenv("AISATYAGRAH_ROOT") or Path(__file__).resolve().parents[2]).resolve()
+EXPORTS = (ROOT / "exports")
+EXPORTS.mkdir(parents=True, exist_ok=True)
+
+# ---------- tiny helpers ----------
+def _bool_env(name: str) -> bool:
+    v = os.getenv(name)
+    return str(v).lower() in ("1","true","yes","on")
+
+def _auth_token() -> str:
+    return os.getenv("AUTH_TOKEN", "")
+
+def _jwt_secret() -> str | None:
+    v = os.getenv("JWT_SECRET")
+    return v if v else None
+
+def _auth_ok(req: Request) -> bool:
+    """Accept x-auth: <token>, or Authorization: Bearer <token or jwt>."""
+    tok = _auth_token()
+    if not tok:
+        return True  # auth disabled
+
+    # x-auth
+    xa = req.headers.get("x-auth") or req.headers.get("x_auth")
+    if xa and xa == tok:
+        return True
+
+    # Authorization
+    auth = req.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        bearer = auth.split(" ", 1)[1].strip()
+        if bearer == tok:
+            return True
+        sec = _jwt_secret()
+        if sec:
+            try:
+                import jwt  # optional
+                jwt.decode(bearer, sec, algorithms=["HS256"])
+                return True
+            except Exception:
+                pass
+    return False
+
+PUBLIC_PATHS = {
+    "/", "/api/health", "/api/version", "/metrics",
+    "/ui/exporter", "/ui/exporter.html",
+}
+
+def _list_export_files(limit: int, offset: int) -> dict:
+    items = []
+    # newest first
+    for p in sorted(EXPORTS.rglob("*"), key=lambda q: q.stat().st_mtime, reverse=True):
+        if p.is_file():
+            st = p.stat()
+            items.append({"path": str(p), "size": st.st_size, "mtime": st.st_mtime})
+    total = len(items)
+    return {"ok": True, "items": items[offset:offset+limit], "total": total, "limit": limit, "offset": offset}
+
+def _cleanup_files(older_than_days: int) -> dict:
+    now = time.time()
+    removed = 0
+    removed_dirs = 0
+    # remove old files
+    for p in list(EXPORTS.rglob("*")):
+        try:
+            if p.is_file():
+                age_days = (now - p.stat().st_mtime) / 86400.0
+                if age_days >= older_than_days:
+                    p.unlink(missing_ok=True)
+                    removed += 1
+        except Exception:
+            pass
+    # prune empty folders
+    for d in sorted(EXPORTS.rglob("*"), reverse=True):
+        if d.is_dir():
+            try:
+                next(d.iterdir())
+            except StopIteration:
+                try:
+                    d.rmdir()
+                    removed_dirs += 1
+                except Exception:
+                    pass
+    return {"ok": True, "removed": removed, "removed_dirs": removed_dirs, "older_than_days": older_than_days}
+
+# ---------- ASGI factory ----------
+def create_app() -> FastAPI:
+    app = FastAPI(title="AISatyagrah Jobs API")
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        path = request.url.path
+        if path in PUBLIC_PATHS or path.startswith("/static"):
+            return await call_next(request)
+        if not _auth_ok(request):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+    # ---- routes ----
+    @app.get("/", response_class=HTMLResponse)
+    async def root():
+        return HTMLResponse(
+            "<h1>AISatyagrah Jobs API</h1>"
+            "<ul>"
+            "<li>GET /api/version</li>"
+            "<li>GET /api/health</li>"
+            "<li>GET /api/config</li>"
+            "<li>POST /api/export/all etc.</li>"
+            "<li>POST /api/jobs, GET/DELETE /api/jobs/&lt;id&gt;, "
+            "SSE /api/jobs/&lt;id&gt;/events</li>"
+            "<li>GET /api/files, POST /api/files/cleanup</li>"
+            "<li>GET /api/history</li>"
+            "<li>GET /metrics (Prometheus)</li>"
+            "</ul>"
+        )
+
+    @app.get("/api/health")
+    async def api_health():
+        return {"ok": True, "ts": time.time()}
+
+    @app.get("/api/version")
+    async def api_version():
+        return {"ok": True, "version": "jobs-api-standup-1"}
+
+    @app.get("/api/config")
+    async def api_config():
+        return {
+            "ok": True,
+            "root": str(ROOT),
+            "auth_enabled": bool(_auth_token()),
+            "jwt_enabled": bool(_jwt_secret()),
+            "ui_origins": [
+                "http://127.0.0.1:9000", "http://localhost:9000",
+                "http://127.0.0.1:8010", "http://localhost:8010",
+            ],
+            "redis_enabled": bool(os.getenv("REDIS_URL")),
+            "redis_url_set": bool(os.getenv("REDIS_URL")),
+            "db_backend": "sqlite",
+            "debug": _bool_env("DEBUG"),
+        }
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics():
+        return (
+            "# HELP exports_started_total Number of exports started\n"
+            "# TYPE exports_started_total counter\n"
+            "exports_started_total 0\n"
+            "# HELP exports_succeeded_total Number of exports succeeded\n"
+            "# TYPE exports_succeeded_total counter\n"
+            "exports_succeeded_total 0\n"
+            "# HELP exports_failed_total Number of exports failed\n"
+            "# TYPE exports_failed_total counter\n"
+            "exports_failed_total 0\n"
+            "# HELP export_duration_seconds_sum Sum of durations\n"
+            "# TYPE export_duration_seconds_sum counter\n"
+            "export_duration_seconds_sum 0.0\n"
+            "# HELP export_duration_seconds_count Count of durations\n"
+            "# TYPE export_duration_seconds_count counter\n"
+            "export_duration_seconds_count 0\n"
+            "# HELP export_queue_length jobs pending in queue (redis+memory)\n"
+            "# TYPE export_queue_length gauge\n"
+            "export_queue_length{backend='redis'} 0\n"
+            "export_queue_length{backend='memory'} 0\n"
+        )
+
+    @app.get("/api/files")
+    async def api_files(limit: int = 20, offset: int = 0):
+        return _list_export_files(limit, offset)
+
+    @app.post("/api/files/cleanup")
+    async def api_files_cleanup(older_than_days: int = 60):
+        return _cleanup_files(older_than_days)
+
+    # stubs so clients don't 405 while we wire the real worker paths
+    @app.post("/api/jobs")
+    async def api_jobs(kind: str = "all", use_redis: bool = False):
+        return {"ok": True, "id": None, "backend": "redis" if use_redis else "memory", "kind": kind, "status": "queued"}
+
+    @app.get("/api/jobs/{job_id}")
+    async def api_jobs_get(job_id: str):
+        return {"ok": False, "error": "not_found"}
+
+    @app.delete("/api/jobs/{job_id}")
+    async def api_jobs_delete(job_id: str):
+        return {"ok": True, "deleted": False}
+
+    @app.get("/ui/exporter", response_class=HTMLResponse)
+    async def exporter_ui():
+        p = ROOT / "ui" / "exporter.html"
+        if p.exists():
+            try:
+                return HTMLResponse(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return HTMLResponse("<p>Exporter UI not found. Use the API or create ui/exporter.html.</p>")
+
+    return app
+
+# allow "uvicorn ...:app" too
+try:
+    app = create_app()
+except Exception:
+    app = FastAPI(title="AISatyagrah Jobs API (bootstrap)")
+    @app.get("/")
+    async def _b():
+        return {"ok": False, "error": "bootstrap-only (start with --factory)"}

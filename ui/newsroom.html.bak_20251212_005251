@@ -1,0 +1,72 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AISatyagrah â€” Newsroom</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/ui/newsroom.css" />
+<link rel="stylesheet" href="/ui-static/newsroom_toolbar.css">
+<!-- NR_TOOLBAR_PATCH -->
+</head>
+<body>
+  <header>
+    <h1>AISatyagrah â€” Newsroom</h1>
+    <div class="token">
+      <label>x-auth token (optional)</label>
+      <input id="token" type="text" placeholder="token..." />
+      <button id="saveToken">Save</button>
+    </div>
+  </header>
+
+  <section class="controls">
+    <div class="row">
+      <div class="group">
+        <label>Date</label>
+        <input id="date" type="date" />
+        <button id="prevDay">â€¹</button>
+        <button id="nextDay">â€º</button>
+      </div>
+
+      <div class="group">
+        <label>Platform</label>
+        <select id="platform">
+          <option value="telegram">telegram</option>
+          <option value="instagram">instagram</option>
+        </select>
+      </div>
+
+      <div class="group">
+        <button id="load">Load plan</button>
+        <button id="latest">Latest telegram</button>
+        <button id="build">â†» Generate from CSV</button>
+      </div>
+
+      <div class="group">
+        <label class="chk"><input id="dryrun" type="checkbox" checked /> Dry run (donâ€™t send Telegram)</label>
+        <label class="chk"><input id="skipig" type="checkbox" /> Skip Instagram captions</label>
+        <button id="run">Run pipeline</button>
+        <button id="dlIG">ðŸ“¥ IG captions</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="filters">
+        <button class="pill" data-filter="all">All (<span id="count-all">0</span>)</button>
+        <button class="pill" data-filter="draft">Draft (<span id="count-draft">0</span>)</button>
+        <button class="pill" data-filter="approved">Approved (<span id="count-approved">0</span>)</button>
+        <button class="pill" data-filter="sent">Sent (<span id="count-sent">0</span>)</button>
+      </div>
+      <div id="summary" class="summary hidden"></div>
+    </div>
+
+    <div id="meta" class="meta"></div>
+    <div id="toast" class="toast hidden"></div>
+  </section>
+
+  <section id="table"></section>
+
+  <script src="/ui/newsroom.js"></script>
+<script src="/ui-static/newsroom_toolbar.js"></script>
+</body>
+</html>
+

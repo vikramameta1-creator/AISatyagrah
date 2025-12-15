@@ -1,0 +1,34 @@
+Batch: processing top 3 items from shortlist (D:\AISatyagrah\data\runs\2025-09-20\shortlist.json)
+
+=== [1/3] quick pipeline (idx=1) ===
+
+Prompt -> D:\AISatyagrah\data\runs\2025-09-20\prompts\t13.prompt.json
+Image  -> D:\AISatyagrah\data\runs\2025-09-20\art\t13_hero.png
+Seed saved -> D:\AISatyagrah\data\runs\2025-09-20\seeds.json
+Facts  -> D:\AISatyagrah\data\runs\2025-09-20\facts.json
+Layout -> D:\AISatyagrah\exports\2025-09-20\onepager_4x5.png | D:\AISatyagrah\exports\2025-09-20\onepager_1x1.png | D:\AISatyagrah\exports\2025-09-20\onepager_9x16.png
+Caption[en] -> D:\AISatyagrah\exports\2025-09-20\caption_en.txt
+Caption[hi] -> D:\AISatyagrah\exports\2025-09-20\caption_hi.txt
+ZIP    -> D:\AISatyagrah\exports\2025-09-20\postpack.zip
+
+=== [2/3] quick pipeline (idx=2) ===
+
+Prompt -> D:\AISatyagrah\data\runs\2025-09-20\prompts\t14.prompt.json
+Image  -> D:\AISatyagrah\data\runs\2025-09-20\art\t14_hero.png
+Seed saved -> D:\AISatyagrah\data\runs\2025-09-20\seeds.json
+Facts  -> D:\AISatyagrah\data\runs\2025-09-20\facts.json
+Layout -> D:\AISatyagrah\exports\2025-09-20\onepager_4x5.png | D:\AISatyagrah\exports\2025-09-20\onepager_1x1.png | D:\AISatyagrah\exports\2025-09-20\onepager_9x16.png
+Caption[en] -> D:\AISatyagrah\exports\2025-09-20\caption_en.txt
+Caption[hi] -> D:\AISatyagrah\exports\2025-09-20\caption_hi.txt
+ZIP    -> D:\AISatyagrah\exports\2025-09-20\postpack.zip
+
+=== [3/3] quick pipeline (idx=3) ===
+
+Prompt -> D:\AISatyagrah\data\runs\2025-09-20\prompts\t15.prompt.json
+Image  -> D:\AISatyagrah\data\runs\2025-09-20\art\t15_hero.png
+Seed saved -> D:\AISatyagrah\data\runs\2025-09-20\seeds.json
+Facts  -> D:\AISatyagrah\data\runs\2025-09-20\facts.json
+Layout -> D:\AISatyagrah\exports\2025-09-20\onepager_4x5.png | D:\AISatyagrah\exports\2025-09-20\onepager_1x1.png | D:\AISatyagrah\exports\2025-09-20\onepager_9x16.png
+Caption[en] -> D:\AISatyagrah\exports\2025-09-20\caption_en.txt
+Caption[hi] -> D:\AISatyagrah\exports\2025-09-20\caption_hi.txt
+ZIP    -> D:\AISatyagrah\exports\2025-09-20\postpack.zip

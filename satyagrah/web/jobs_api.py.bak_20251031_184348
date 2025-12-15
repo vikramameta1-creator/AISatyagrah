@@ -1,0 +1,583 @@
+﻿# -*- coding: utf-8 -*-
+"""
+AISatyagrah — Jobs API (FastAPI, single-file, Windows friendly)
+
+Features
+- /api/version, /api/health, /api/config (auth)
+- /api/files (offset/limit), /api/files/cleanup (auth)
+- /api/export/all (auth) -> CSV/PDF/PPTX/GIF/MP4/ZIP + job + SSE progress
+- /api/history (auth, SQLite), /api/history/backfill (auth)
+- /api/jobs/{id} GET/PATCH (auth)
+- /metrics (Prometheus)
+- /ui/exporter, /ui/history (fallback HTML if ui/*.html missing)
+
+Auth
+- x-auth header (env AUTH_TOKEN)
+- optional JWT Bearer (env JWT_SECRET, requires PyJWT)
+
+Enrich
+- Tries to import make_pdf/make_pptx from enrich.py (project root or satyagrah/exports/enrich.py).
+- Falls back to explanatory placeholder files if libs are missing.
+
+This file embeds a minimal SQLite store so you can run immediately without extra modules.
+"""
+
+from __future__ import annotations
+
+import os, io, json, time, sqlite3, asyncio, zipfile, csv, traceback
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import (
+    HTMLResponse, FileResponse, PlainTextResponse, StreamingResponse
+)
+
+# --------------------------- ENV / ROOT ------------------------------------
+
+def _ts() -> float: return time.time()
+
+def _root_default() -> Path:
+    d = Path(r"D:\AISatyagrah")
+    return d if d.exists() else Path.cwd()
+
+ROOT: Path = Path(os.environ.get("AIST_ROOT", str(_root_default()))).resolve()
+UI_DIR = ROOT / "ui"
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def _exports_roots(root: Path) -> List[Path]:
+    # observed both locations in your runs
+    return [root / "exports", root / "satyagrah" / "exports"]
+
+EXPORT_DIRS = _exports_roots(ROOT)
+
+# --------------------------- AUTH ------------------------------------------
+
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
+try:
+    import jwt  # PyJWT
+except Exception:
+    jwt = None
+
+def _auth_enabled() -> bool:
+    return bool(AUTH_TOKEN) or (bool(JWT_SECRET) and jwt is not None)
+
+def _require_auth(req: Request) -> None:
+    if not _auth_enabled():
+        return
+    # x-auth
+    if AUTH_TOKEN and req.headers.get("x-auth", "").strip() == AUTH_TOKEN:
+        return
+    # Bearer JWT
+    if JWT_SECRET and jwt is not None:
+        auth = req.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            tok = auth.split(" ", 1)[1].strip()
+            try:
+                jwt.decode(tok, JWT_SECRET, algorithms=["HS256"])
+                return
+            except Exception:
+                pass
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+# --------------------------- ENRICH IMPORT ---------------------------------
+
+def _try_import_enrich(root: Path):
+    """Import make_pdf/make_pptx if available; return (make_pdf, make_pptx) or (None, None)."""
+    # 1) project root: D:\AISatyagrah\enrich.py
+    try:
+        import importlib.util
+        p = root / "enrich.py"
+        if p.exists():
+            spec = importlib.util.spec_from_file_location("enrich", str(p))
+            mod = importlib.util.module_from_spec(spec)  # type: ignore
+            assert spec and spec.loader
+            spec.loader.exec_module(mod)  # type: ignore
+            return getattr(mod, "make_pdf", None), getattr(mod, "make_pptx", None)
+    except Exception:
+        pass
+    # 2) satyagrah/exports/enrich.py
+    try:
+        from satyagrah.exports.enrich import make_pdf, make_pptx  # type: ignore
+        return make_pdf, make_pptx
+    except Exception:
+        return None, None
+
+MAKE_PDF, MAKE_PPTX = _try_import_enrich(ROOT)
+
+# --------------------------- FILE HELPERS ----------------------------------
+
+def _mkdir(p: Path) -> None: p.parent.mkdir(parents=True, exist_ok=True)
+
+def _list_files(roots: List[Path], limit: int = 50, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+    items: List[Dict[str, Any]] = []
+    for r in roots:
+        if not r.exists(): continue
+        for p in r.rglob("*"):
+            if not p.is_file(): continue
+            try:
+                st = p.stat()
+            except Exception:
+                continue
+            items.append({"path": str(p), "size": st.st_size, "mtime": st.st_mtime})
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    total = len(items)
+    return items[offset: offset + limit], total
+
+def _write_csv(path: Path) -> None:
+    _mkdir(path)
+    now = datetime.now().isoformat(timespec="seconds")
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "value", "generated"])
+        w.writerow(["sample", 1, now])
+
+def _write_gif(path: Path) -> None:
+    # tiny 1x1 transparent gif
+    _mkdir(path)
+    b = bytes.fromhex("47494638396101000100f00000ffffff00000021f90401000001002c00000000010001000002024401003b")
+    path.write_bytes(b)
+
+def _write_mp4_or_note(path: Path) -> None:
+    from shutil import which
+    _mkdir(path)
+    if which("ffmpeg"):
+        os.system(f'ffmpeg -f lavfi -i color=c=black:s=320x240:d=1 -y "{path}" >NUL 2>&1')
+        if not path.exists():
+            path.write_text("ffmpeg failed to create mp4\n", encoding="utf-8")
+    else:
+        path.with_suffix(".txt").write_text("Install ffmpeg in PATH for real MP4 output.\n", encoding="utf-8")
+
+def _zip_together(out_zip: Path, files: List[Path]) -> None:
+    _mkdir(out_zip)
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            if f.exists():
+                z.write(str(f), arcname=f.name)
+
+# --------------------------- MINIMAL SQLITE STORE --------------------------
+
+class JobsStore:
+    """
+    Very small SQLite job store:
+      id TEXT PRIMARY KEY
+      kind TEXT
+      backend TEXT
+      status TEXT
+      created_at REAL
+      updated_at REAL
+      params TEXT (JSON)
+      result TEXT (JSON)
+      error TEXT
+    """
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init()
+
+    def _conn(self):
+        return sqlite3.connect(str(self.db_path))
+
+    def _init(self):
+        with self._conn() as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS jobs(
+                  id TEXT PRIMARY KEY,
+                  kind TEXT,
+                  backend TEXT,
+                  status TEXT,
+                  created_at REAL,
+                  updated_at REAL,
+                  params TEXT,
+                  result TEXT,
+                  error TEXT
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at DESC)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC)")
+
+    def create(self, id: str, kind: str, backend: str, status: str,
+               params: Optional[Dict[str, Any]] = None, result: Optional[Dict[str, Any]] = None):
+        now = _ts()
+        with self._conn() as c:
+            c.execute("""
+              INSERT OR REPLACE INTO jobs(id,kind,backend,status,created_at,updated_at,params,result,error)
+              VALUES(?,?,?,?,?,?,?,?,?)
+            """, (id, kind, backend, status, now, now,
+                  json.dumps(params or {}), json.dumps(result or {}), ""))
+
+    # Backwards-friendly convenience
+    add = create
+
+    def update(self, id: str, **fields):
+        if not fields: return
+        allowed = {"kind","backend","status","params","result","error"}
+        sets, args = [], []
+        for k,v in fields.items():
+            if k not in allowed: continue
+            if k in ("params","result") and not isinstance(v,(str,bytes)):
+                v = json.dumps(v or {})
+            sets.append(f"{k}=?"); args.append(v)
+        sets.append("updated_at=?"); args.append(_ts())
+        args.append(id)
+        with self._conn() as c:
+            c.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id=?", args)
+
+    def get(self, id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as c:
+            cur = c.execute("SELECT id,kind,backend,status,created_at,updated_at,params,result,error FROM jobs WHERE id=?", (id,))
+            row = cur.fetchone()
+        if not row: return None
+        return {
+            "id": row[0],
+            "kind": row[1],
+            "backend": row[2],
+            "status": row[3],
+            "created_at": row[4],
+            "updated_at": row[5],
+            "params": json.loads(row[6] or "{}"),
+            "result": json.loads(row[7] or "{}"),
+            "error": row[8] or "",
+        }
+
+    def list(self, limit: int = 50, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+        with self._conn() as c:
+            cur = c.execute("SELECT COUNT(*) FROM jobs")
+            total = cur.fetchone()[0]
+            cur = c.execute("""
+                SELECT id,kind,backend,status,created_at,updated_at,params,result,error
+                FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?
+            """, (limit, offset))
+            rows = cur.fetchall()
+        items = []
+        for r in rows:
+            items.append({
+                "id": r[0], "kind": r[1], "backend": r[2], "status": r[3],
+                "created_at": r[4], "updated_at": r[5],
+                "params": json.loads(r[6] or "{}"),
+                "result": json.loads(r[7] or "{}"),
+                "error": r[8] or "",
+            })
+        return items, total
+
+# --------------------------- APP FACTORY -----------------------------------
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="AISatyagrah Jobs API")
+
+    # state
+    app.state.root = ROOT
+    app.state.ui_dir = UI_DIR
+    app.state.exports = EXPORT_DIRS
+    app.state.store = JobsStore(DATA_DIR / "jobs.sqlite")
+    app.state.progress = {}
+    app.state.jwt_on = bool(JWT_SECRET and jwt is not None)
+    app.state.counters = {"exports_started": 0, "exports_ok": 0, "exports_failed": 0}
+
+    PUBLIC_PATHS = {"/", "/api/health", "/api/version", "/metrics", "/ui/exporter", "/ui/history"}
+
+    # ---------- Auth middleware (applies only if auth is enabled) ----------
+    @app.middleware("http")
+    async def auth_mw(request: Request, call_next):
+        if not _auth_enabled():
+            return await call_next(request)
+        path = request.url.path
+        # allow static UI files
+        if path in PUBLIC_PATHS or path.startswith("/ui/"):
+            return await call_next(request)
+        # protected endpoints
+        try:
+            _require_auth(request)
+        except HTTPException as e:
+            return PlainTextResponse(json.dumps({"detail": "unauthorized"}), status_code=401)
+        return await call_next(request)
+
+    # ---------------- UI ROUTES ----------------
+    @app.get("/", response_class=HTMLResponse)
+    async def index():
+        return HTMLResponse("""
+<!doctype html><meta charset="utf-8">
+<title>AISatyagrah Jobs API</title>
+<body style="font-family:system-ui;background:#111;color:#eee;padding:20px">
+<h2>AISatyagrah Jobs API</h2>
+<ul>
+  <li>GET <code>/api/version</code></li>
+  <li>GET <code>/api/health</code></li>
+  <li>GET <code>/api/config</code> (auth)</li>
+  <li>POST <code>/api/export/all</code> (auth)</li>
+  <li>GET <code>/api/files</code>, POST <code>/api/files/cleanup</code> (auth)</li>
+  <li>GET <code>/api/history</code>, POST <code>/api/history/backfill</code> (auth)</li>
+  <li>GET <code>/api/jobs/&lt;id&gt;</code>, PATCH <code>/api/jobs/&lt;id&gt;</code> (auth)</li>
+  <li>GET <code>/metrics</code></li>
+  <li>UI: <a href="/ui/exporter">/ui/exporter</a>, <a href="/ui/history">/ui/history</a></li>
+</ul>
+</body>""")
+
+    @app.get("/ui/exporter", response_class=HTMLResponse)
+    async def ui_exporter():
+        f = app.state.ui_dir / "exporter.html"
+        if f.exists(): return FileResponse(str(f), media_type="text/html")
+        return HTMLResponse("""
+<!doctype html><meta charset="utf-8">
+<title>Exporter</title>
+<body style="font-family:system-ui;background:#0b0b0b;color:#f0f0f0;padding:20px">
+<h2>Exporter</h2>
+<p>Put a custom UI at <code>ui/exporter.html</code>.</p>
+<p>Try <a href="/ui/history">/ui/history</a> or use curl/PowerShell to call the API.</p>
+</body>""")
+
+    @app.get("/ui/history", response_class=HTMLResponse)
+    async def ui_history():
+        return HTMLResponse("""
+<!doctype html><meta charset="utf-8">
+<title>History</title>
+<body style="font-family:system-ui;background:#0b0b0b;color:#f0f0f0;padding:20px">
+<h2>Export History</h2>
+<label>Token: <input id="t" style="width:340px"></label>
+<button onclick="localStorage.token=document.getElementById('t').value; load()">Save</button>
+<pre id="out" style="white-space:pre-wrap;background:#111;padding:12px;border-radius:8px"></pre>
+<script>
+const BASE = location.origin;
+async function load() {
+  const hdr = localStorage.token ? {'x-auth': localStorage.token} : {};
+  const r = await fetch(BASE + '/api/history?limit=50&offset=0', {headers: hdr});
+  document.getElementById('out').textContent = JSON.stringify(await r.json(), null, 2);
+}
+document.getElementById('t').value = localStorage.token || '';
+load();
+</script>
+</body>""")
+
+    # ---------------- BASIC API ----------------
+    @app.get("/api/version")
+    async def api_version():
+        return {"ok": True, "version": "1.0.0", "ts": _ts()}
+
+    @app.get("/api/health")
+    async def api_health():
+        return {"ok": True, "ts": _ts()}
+
+    @app.get("/api/config")
+    async def api_config(req: Request):
+        _require_auth(req)
+        return {
+            "ok": True,
+            "root": str(app.state.root),
+            "auth_enabled": _auth_enabled(),
+            "jwt_enabled": app.state.jwt_on,
+            "exports": [str(p) for p in app.state.exports],
+            "db": str((DATA_DIR / "jobs.sqlite")),
+        }
+
+    # ---------------- FILES ----------------
+    @app.get("/api/files")
+    async def api_files(limit: int = 50, offset: int = 0):
+        files, total = _list_files(app.state.exports, limit, offset)
+        return {"ok": True, "items": files, "total": total, "limit": limit, "offset": offset}
+
+    @app.post("/api/files/cleanup")
+    async def api_files_cleanup(req: Request, older_than_days: int = 60):
+        _require_auth(req)
+        cutoff = time.time() - older_than_days * 86400
+        removed = 0
+        for r in app.state.exports:
+            if not r.exists(): continue
+            for p in r.rglob("*"):
+                if p.is_file():
+                    try:
+                        if p.stat().st_mtime < cutoff:
+                            p.unlink(missing_ok=True)
+                            removed += 1
+                    except Exception:
+                        pass
+        return {"ok": True, "removed": removed}
+
+    # ---------------- JOBS & HISTORY ----------------
+    @app.get("/api/jobs/{jid}")
+    async def api_job_get(req: Request, jid: str):
+        _require_auth(req)
+        row = app.state.store.get(jid)
+        if not row: raise HTTPException(404, detail="not found")
+        return {"ok": True, "item": row}
+
+    @app.patch("/api/jobs/{jid}")
+    async def api_job_patch(req: Request, jid: str):
+        _require_auth(req)
+        row = app.state.store.get(jid)
+        if not row: raise HTTPException(404, detail="not found")
+        data = await req.json()
+        allowed = {}
+        for k in ("status", "error", "result", "params"):
+            if k in data: allowed[k] = data[k]
+        if not allowed:
+            return {"ok": False, "error": "no fields to update"}
+        app.state.store.update(jid, **allowed)
+        return {"ok": True, "updated": list(allowed.keys())}
+
+    @app.get("/api/history")
+    async def api_history(req: Request, limit: int = 50, offset: int = 0):
+        _require_auth(req)
+        items, total = app.state.store.list(limit=limit, offset=offset)
+        return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+    @app.post("/api/history/backfill")
+    async def api_history_backfill(req: Request):
+        _require_auth(req)
+        exts = {".zip", ".pdf", ".pptx", ".csv", ".gif", ".mp4"}
+        groups: Dict[str, Dict[str, Any]] = {}
+        def prefix_of(p: Path) -> str:
+            stem = p.stem
+            if stem.endswith(".txt"):
+                stem = Path(stem).stem
+            return stem
+        for rootp in app.state.exports:
+            if not rootp.exists(): continue
+            for p in rootp.rglob("*"):
+                if p.is_file() and p.suffix.lower() in exts:
+                    pref = prefix_of(p)
+                    d = groups.get(pref) or {"files": [], "created_at": p.stat().st_mtime}
+                    d["files"].append(str(p))
+                    d["created_at"] = min(d["created_at"], p.stat().st_mtime)
+                    groups[pref] = d
+
+        NS = "12345678-1234-5678-9abc-0123456789ab"  # fixed namespace for deterministic uuids via pref
+        import uuid as _uuid
+        added = 0
+        for pref, info in groups.items():
+            jid = str(_uuid.uuid5(_uuid.UUID(NS), pref))
+            if app.state.store.get(jid): continue
+            app.state.store.create(jid, kind="all", backend="backfill", status="succeeded",
+                                   params={"backfill": True}, result={"group": pref, "files": info["files"]})
+            added += 1
+        return {"ok": True, "added": added, "groups": len(groups)}
+
+    # ---------------- EXPORT (makes a job + files) ----------------
+    @app.post("/api/export/all")
+    async def api_export_all(req: Request):
+        _require_auth(req)
+        try:
+            data = await req.json()
+        except Exception:
+            data = {}
+        date_str = (data.get("date") or "").strip() or None
+
+        import uuid as _uuid
+        jid = str(_uuid.uuid4())
+
+        app.state.store.create(jid, kind="all", backend="memory", status="queued",
+                               params={"date": date_str, "source": "export/all"})
+        app.state.counters["exports_started"] += 1
+        app.state.progress[jid] = 0.0
+
+        asyncio.create_task(_run_export_job(app, jid, date_str))
+        return {"ok": True, "id": jid, "backend": "memory", "status": "queued"}
+
+    async def _run_export_job(app: FastAPI, job_id: str, date_str: Optional[str]):
+        try:
+            app.state.store.update(job_id, status="running")
+            day = date_str or datetime.now().date().isoformat()
+            outdir = ROOT / "exports" / day
+            outdir.mkdir(parents=True, exist_ok=True)
+            stamp = f"{day}_{datetime.now().strftime('%H%M%S')}"
+            pdf_path  = outdir / f"export_{stamp}.pdf"
+            pptx_path = outdir / f"export_{stamp}.pptx"
+            csv_path  = outdir / f"export_{stamp}.csv"
+            gif_path  = outdir / f"export_{stamp}.gif"
+            mp4_path  = outdir / f"export_{stamp}.mp4"
+            zip_path  = outdir / f"export_{stamp}.zip"
+
+            # Collect candidates (for PDF/PPTX indexing)
+            candidates: List[Path] = []
+            for p in outdir.iterdir():
+                if p.is_file(): candidates.append(p)
+
+            # PDF
+            if MAKE_PDF:
+                try:
+                    MAKE_PDF([str(p) for p in candidates], str(pdf_path), title="AISatyagrah Export")
+                except Exception:
+                    pdf_path.write_text("ReportLab failed (see console).", encoding="utf-8")
+            else:
+                pdf_path.write_text("Install reportlab for real PDFs.", encoding="utf-8")
+
+            # PPTX
+            if MAKE_PPTX:
+                try:
+                    MAKE_PPTX([str(p) for p in candidates], str(pptx_path), title="AISatyagrah Export")
+                except Exception:
+                    pptx_path.write_text("python-pptx/Pillow failed (see console).", encoding="utf-8")
+            else:
+                pptx_path.write_text("Install python-pptx & Pillow for real PPTX.", encoding="utf-8")
+
+            app.state.progress[job_id] = 0.6
+
+            # Other files
+            _write_csv(csv_path)
+            _write_gif(gif_path)
+            _write_mp4_or_note(mp4_path)
+
+            app.state.progress[job_id] = 0.85
+
+            _zip_together(zip_path, [pdf_path, pptx_path, csv_path, gif_path, mp4_path])
+            app.state.progress[job_id] = 1.0
+
+            result = {
+                "date": day,
+                "pdf": str(pdf_path),
+                "pptx": str(pptx_path),
+                "csv": str(csv_path),
+                "gif": str(gif_path),
+                "mp4": str(mp4_path),
+                "zip": str(zip_path),
+            }
+            app.state.store.update(job_id, status="succeeded", result=result)
+            app.state.counters["exports_ok"] += 1
+        except Exception:
+            tb = traceback.format_exc()
+            app.state.store.update(job_id, status="failed", result={"error": "export_failed", "traceback": tb})
+            app.state.counters["exports_failed"] += 1
+
+    @app.get("/api/jobs/{job_id}/events")
+    async def api_job_events(job_id: str, request: Request):
+        async def gen():
+            while True:
+                if await request.is_disconnected():
+                    break
+                row = app.state.store.get(job_id)
+                status = row["status"] if row else "unknown"
+                prog = float(app.state.progress.get(job_id, 0.0))
+                payload = {"ok": True, "job_id": job_id, "status": status, "progress": prog}
+                yield f"data: {json.dumps(payload)}\n\n"
+                if status in ("succeeded", "failed", "cancelled"):
+                    break
+                await asyncio.sleep(1.0)
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    # ---------------- METRICS ----------------
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics():
+        c = app.state.counters
+        lines = [
+            "# HELP exports_started_total Number of exports started",
+            "# TYPE exports_started_total counter",
+            f"exports_started_total {c['exports_started']}",
+            "# HELP exports_succeeded_total Number of exports succeeded",
+            "# TYPE exports_succeeded_total counter",
+            f"exports_succeeded_total {c['exports_ok']}",
+            "# HELP exports_failed_total Number of exports failed",
+            "# TYPE exports_failed_total counter",
+            f"exports_failed_total {c['exports_failed']}",
+            "# HELP export_queue_length jobs pending in queue (redis+memory)",
+            "# TYPE export_queue_length gauge",
+            "export_queue_length{backend='redis'} 0",
+            "export_queue_length{backend='memory'} 0",
+        ]
+        return "\n".join(lines) + "\n"
+
+    return app
+
+# both styles supported:
+app = create_app()

@@ -1,0 +1,12 @@
+# satyagrah/worker/worker.py
+import os
+from redis import Redis
+from rq import Connection, Worker, Queue
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+queues = [Queue("exports")]
+
+if __name__ == "__main__":
+    conn = Redis.from_url(REDIS_URL)
+    with Connection(conn):
+        Worker(queues).work(with_scheduler=True)

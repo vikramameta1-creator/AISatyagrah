@@ -1,0 +1,10 @@
+﻿/* ui/newsroom_toolbar.css */
+#nr-toolbar{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;background:#131729;border:1px solid #283252;border-radius:12px;padding:10px;margin:12px 0}
+#nr-toolbar input[type="text"], #nr-toolbar input[type="search"], #nr-toolbar input[type="password"], #nr-toolbar select{
+  background:#0d1122;border:1px solid #303a60;color:#e6e8f2;border-radius:10px;padding:8px 10px;min-width:220px;outline:none
+}
+#nr-toolbar button{background:#6f64ff;color:#fff;border:none;border-radius:10px;padding:8px 12px;cursor:pointer}
+#nr-toolbar button:hover{filter:brightness(1.1)}
+#nr-toast{margin-left:auto;font-size:12px;color:#9aa2bd}
+#nr-output{margin:8px 0;padding:10px;background:#0d1122;border:1px solid #283252;border-radius:10px;color:#cfd4eb;max-height:360px;overflow:auto}
+.nr-badge{display:inline-block;padding:2px 8px;border-radius:10px;background:#283252;color:#cfd4eb;font-size:12px;margin-right:6px}

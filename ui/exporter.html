@@ -1,0 +1,20 @@
+﻿<!doctype html><meta charset="utf-8"><title>Exporter</title>
+<body style="background:#0b0e12;color:#e7e7e7;font:16px system-ui;padding:24px">
+  <h1>Exporter</h1>
+  <label>Token: <input id="t" style="width:420px"></label>
+  <button onclick="localStorage.token=document.getElementById('t').value;out('saved')">Save</button>
+  <hr>
+  <button onclick="api('/api/export/all',{method:'POST'})">Export All</button>
+  <button onclick="api('/api/files?limit=10&offset=0')">List Latest Files</button>
+  <button onclick="api('/api/config')">Show Config</button>
+  <pre id="o" style="white-space:pre-wrap;background:#12151b;padding:16px;border-radius:12px"></pre>
+<script>
+const BASE='http://127.0.0.1:9000'; const O=document.getElementById('o');
+document.getElementById('t').value=localStorage.token||'mysupersecrettoken';
+const out = (x)=>O.textContent=typeof x==='string'?x:JSON.stringify(x,null,2);
+async function api(path,opts={}) {
+  const h=opts.headers||{}; h['x-auth']=localStorage.token||''; opts.headers=h;
+  const r=await fetch(BASE+path,opts); out(await r.json());
+}
+</script>
+</body>

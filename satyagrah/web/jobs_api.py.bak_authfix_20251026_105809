@@ -1,0 +1,63 @@
+﻿# BEGIN_AUTH_GUARD
+# Public routes that never require auth
+PUBLIC_PATHS = {
+    "/", "/api/health", "/api/version", "/metrics",
+    "/ui/exporter", "/ui/exporter.html",
+}
+
+def _get_effective_token(request):
+    # Accept many ways: x-auth, X-Auth, Authorization (with or without Bearer),
+    # query ?token=, or cookie auth_token
+    token = (
+        request.headers.get("x-auth")
+        or request.headers.get("X-Auth")
+        or request.headers.get("authorization")
+        or request.query_params.get("token")
+        or request.cookies.get("auth_token")
+    )
+    if token:
+        low = token.lower()
+        if low.startswith("bearer "):
+            token = token[7:].strip()
+    return token
+
+@app.middleware("http")
+async def _auth_guard(request, call_next):
+    auth_required = bool(getattr(app.state, "auth_token", None))
+    if not auth_required:
+        return await call_next(request)
+
+    p = request.url.path
+    if p in PUBLIC_PATHS or p.startswith("/ui/") or p.startswith("/static/"):
+        return await call_next(request)
+
+    incoming = _get_effective_token(request)
+    expected = app.state.auth_token
+
+    if incoming == expected:
+        return await call_next(request)
+
+    from starlette.responses import JSONResponse
+    return JSONResponse({"detail": "unauthorized"}, status_code=401)
+
+# Small helper to prove auth works and show which carrier matched
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.get("/api/auth/ping")
+async def api_auth_ping(request: Request):
+    expected = app.state.auth_token or ""
+    incoming = _get_effective_token(request) or ""
+    carrier = ("x-auth" if request.headers.get("x-auth") else
+               "X-Auth" if request.headers.get("X-Auth") else
+               "authorization" if request.headers.get("authorization") else
+               "query.token" if request.query_params.get("token") else
+               "cookie.auth_token" if request.cookies.get("auth_token") else
+               "none")
+    return JSONResponse({
+        "ok": incoming == expected,
+        "carrier": carrier,
+        "expected_prefix": expected[:4],
+        "incoming_prefix": incoming[:4],
+    })
+# END_AUTH_GUARD

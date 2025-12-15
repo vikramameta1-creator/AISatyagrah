@@ -1,0 +1,718 @@
+﻿from __future__ import annotations
+
+import asyncio
+import contextlib
+import datetime as dt
+import json
+import os
+import sqlite3
+import time
+import typing as t
+import uuid
+from pathlib import Path
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from satyagrah.exporter import build_all_exports
+
+# Optional Redis / RQ
+try:
+    import redis as _redis  # type: ignore
+    from rq import Queue  # type: ignore
+    from rq.job import Job as RqJob  # type: ignore
+
+    HAS_RQ = True
+except Exception:
+    _redis = None  # type: ignore
+    Queue = None  # type: ignore
+    RqJob = None  # type: ignore
+    HAS_RQ = False
+
+# Optional JWT
+try:
+    import jwt  # type: ignore
+
+    HAS_JWT = True
+except Exception:
+    HAS_JWT = False
+
+
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
+
+APP_VERSION = "0.0.5"
+
+ROOT = Path(os.environ.get("AISATYAGRAH_ROOT", Path.cwd()))
+DATA = ROOT / "data"
+EXPORTS = ROOT / "exports"
+DATA.mkdir(parents=True, exist_ok=True)
+EXPORTS.mkdir(parents=True, exist_ok=True)
+
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
+AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "") in ("1", "true", "yes")
+
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+REDIS_ENABLED = bool(REDIS_URL) and HAS_RQ
+
+UI_ORIGINS = [
+    "http://127.0.0.1:9000",
+    "http://localhost:9000",
+    "http://127.0.0.1:8010",
+    "http://localhost:8010",
+]
+
+# ------------------------------------------------------------------------------
+# Auth
+# ------------------------------------------------------------------------------
+
+class AuthError(HTTPException):
+    def __init__(self, detail="unauthorized"):
+        super().__init__(status_code=401, detail=detail)
+
+
+def _check_x_auth(req: Request) -> bool:
+    token = req.headers.get("x-auth", "")
+    return bool(AUTH_TOKEN) and token == AUTH_TOKEN
+
+
+def _check_bearer(req: Request) -> bool:
+    if not (HAS_JWT and JWT_SECRET):
+        return False
+    auth = req.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return False
+    tok = auth.split(" ", 1)[1].strip()
+    try:
+        jwt.decode(tok, JWT_SECRET, algorithms=["HS256"])
+        return True
+    except Exception:
+        return False
+
+
+async def require_auth(req: Request) -> None:
+    if AUTH_DISABLED:
+        return
+    if _check_x_auth(req) or _check_bearer(req):
+        return
+    raise AuthError()
+
+
+# ------------------------------------------------------------------------------
+# SQLite store for /api/history
+# ------------------------------------------------------------------------------
+
+class HistoryStore:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self._init()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+
+    def _init(self) -> None:
+        conn = self._connect()
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs_history(
+                    id TEXT PRIMARY KEY,
+                    backend TEXT,
+                    kind TEXT,
+                    status TEXT,
+                    created_at REAL,
+                    updated_at REAL,
+                    result_json TEXT
+                )
+                """
+            )
+        conn.close()
+
+    def upsert(
+        self,
+        *,
+        id: str,
+        backend: str,
+        kind: str,
+        status: str,
+        created_at: float,
+        updated_at: float,
+        result: dict | None = None,
+    ) -> None:
+        payload = json.dumps(result or {}, ensure_ascii=False)
+        conn = self._connect()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO jobs_history(id, backend, kind, status, created_at, updated_at, result_json)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    backend=excluded.backend,
+                    kind=excluded.kind,
+                    status=excluded.status,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at,
+                    result_json=excluded.result_json
+                """,
+                (id, backend, kind, created_at, created_at, payload),
+            )
+        conn.close()
+
+    def list(self, *, limit: int = 20, offset: int = 0) -> dict:
+        conn = self._connect()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM jobs_history")
+        total = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT id, backend, kind, status, created_at, updated_at, result_json
+            FROM jobs_history
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        items = []
+        for r in rows:
+            items.append(
+                dict(
+                    id=r[0],
+                    backend=r[1],
+                    kind=r[2],
+                    status=r[3],
+                    created_at=r[4],
+                    updated_at=r[5],
+                    result=json.loads(r[6] or "{}"),
+                )
+            )
+        return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+
+HISTORY = HistoryStore(DATA / "jobs.db")
+
+# ------------------------------------------------------------------------------
+# Minimal exporter (writes simple placeholder files so it works anywhere)
+# ------------------------------------------------------------------------------
+
+def _today_str() -> str:
+    return dt.date.today().strftime("%Y-%m-%d")
+
+
+def _ensure_day_dir(day: str) -> Path:
+    p = EXPORTS / day
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _write(path: Path, text: str) -> None:
+    path.write_bytes(text.encode("utf-8"))
+
+
+def run_export(kind: str = "all", date: str | None = None) -> dict:
+    """Synchronous export that creates placeholder files and returns their paths."""
+    day = date or _today_str()
+    dest = _ensure_day_dir(day)
+    ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+    result = {
+        "date": day,
+        "csv": str(dest / f"export_{day}_{ts}.csv"),
+        "pdf": str(dest / f"export_{day}_{ts}.pdf"),
+        "pptx": str(dest / f"export_{day}_{ts}.pptx"),
+        "gif": str(dest / f"export_{day}_{ts}.gif"),
+        "mp4": str(dest / f"export_{day}_{ts}.mp4"),
+        "zip": str(dest / f"export_{day}_{ts}.zip"),
+    }
+    # Very light files
+    _write(Path(result["csv"]), "id,name\n1,example\n")
+    _write(Path(result["pdf"]), f"PDF placeholder {ts}\n")
+    _write(Path(result["pptx"]), f"PPTX placeholder {ts}\n")
+    _write(Path(result["gif"]), f"GIF placeholder {ts}\n")
+    _write(Path(result["mp4"]), f"MP4 placeholder {ts}\n")
+    _write(Path(result["zip"]), f"ZIP placeholder {ts}\n")
+    return {"ok": True, **result}
+
+
+# RQ worker target (must be importable)
+def rq_run_export(kind: str = "all", date: str | None = None) -> dict:
+    return run_export(kind, date)
+
+
+# ------------------------------------------------------------------------------
+# Memory job runner with retry/backoff + cancel
+# ------------------------------------------------------------------------------
+
+class MemJob(t.TypedDict, total=False):
+    id: str
+    backend: str  # "memory"
+    kind: str
+    date: str | None
+    status: str
+    progress: float
+    message: str
+    result: dict
+    attempts: list[dict]
+    created_at: float
+    updated_at: float
+    deadline: float
+    cancelled: bool
+
+
+JOBS: dict[str, MemJob] = {}
+EXPORTS_STARTED = 0
+EXPORTS_SUCCEEDED = 0
+EXPORTS_FAILED = 0
+EXPORT_DUR_SUM = 0.0
+EXPORT_DUR_COUNT = 0
+
+
+async def _run_mem_job(job: MemJob, retries: int = 0, backoff: float = 1.0) -> None:
+    global EXPORTS_SUCCEEDED, EXPORTS_FAILED, EXPORT_DUR_SUM, EXPORT_DUR_COUNT
+    attempt = 0
+    start = time.perf_counter()
+    while True:
+        attempt += 1
+        job["updated_at"] = time.time()
+        job["message"] = f"attempt {attempt}"
+        job["progress"] = min(5 + attempt, 90.0)
+        try:
+            # Simulate a small bit of work
+            for i in range(5):
+                if job.get("cancelled"):
+                    job["status"] = "cancelled"
+                    job["message"] = "cancelled"
+                    HISTORY.upsert(
+                        id=job["id"],
+                        backend="memory",
+                        kind=job["kind"],
+                        status=job["status"],
+                        created_at=job["created_at"],
+                        updated_at=time.time(),
+                        result=job.get("result"),
+                    )
+                    return
+                await asyncio.sleep(0.1)
+
+            # Do the export
+            res = run_export(job["kind"], job["date"])
+            job["result"] = {k: v for k, v in res.items() if k != "ok"}
+            job["status"] = "done"
+            job["message"] = "complete"
+            job["progress"] = 100.0
+            job["updated_at"] = time.time()
+
+            dur = time.perf_counter() - start
+            EXPORTS_SUCCEEDED += 1
+            EXPORT_DUR_SUM += dur
+            EXPORT_DUR_COUNT += 1
+
+            HISTORY.upsert(
+                id=job["id"],
+                backend="memory",
+                kind=job["kind"],
+                status=job["status"],
+                created_at=job["created_at"],
+                updated_at=job["updated_at"],
+                result=job.get("result"),
+            )
+            return
+        except Exception as ex:  # pragma: no cover
+            job["attempts"] = job.get("attempts", []) + [
+                {"attempt": attempt, "error": str(ex), "ts": time.time()}
+            ]
+            if attempt <= retries:
+                job["message"] = f"retrying in {backoff}s"
+                job["status"] = "retrying"
+                await asyncio.sleep(backoff)
+                backoff *= 2.0
+                continue
+            job["status"] = "failed"
+            job["message"] = "failed"
+            job["updated_at"] = time.time()
+            EXPORTS_FAILED += 1
+            HISTORY.upsert(
+                id=job["id"],
+                backend="memory",
+                kind=job["kind"],
+                status=job["status"],
+                created_at=job["created_at"],
+                updated_at=job["updated_at"],
+                result=job.get("result"),
+            )
+            return
+
+
+# ------------------------------------------------------------------------------
+# FastAPI app
+# ------------------------------------------------------------------------------
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="AISatyagrah Jobs API", version=APP_VERSION)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=UI_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ---------- Basic ----------
+    @app.get("/", response_class=PlainTextResponse)
+    async def root():
+        return "AISatyagrah Jobs API - /api/*"
+
+    @app.get("/api/health")
+    async def api_health(_: t.Any = Depends(require_auth)):
+        return {"ok": True, "ts": time.time()}
+
+    @app.get("/api/version")
+    async def api_version(_: t.Any = Depends(require_auth)):
+        return {"ok": True, "version": APP_VERSION}
+
+    @app.get("/api/config")
+    async def api_config(_: t.Any = Depends(require_auth)):
+        return {
+            "ok": True,
+            "root": str(ROOT),
+            "auth_enabled": not AUTH_DISABLED,
+            "jwt_enabled": bool(JWT_SECRET),
+            "ui_origins": UI_ORIGINS,
+            "redis_enabled": REDIS_ENABLED,
+            "redis_url_set": bool(REDIS_URL),
+            "db_backend": "sqlite",
+            "debug": bool(os.environ.get("DEBUG")),
+        }
+
+    # ---------- Export (direct) ----------
+    @app.post("/api/export/all")
+    async def api_export_all(_: t.Any = Depends(require_auth)):
+        global EXPORTS_STARTED
+        EXPORTS_STARTED += 1
+        return run_export("all", None)
+
+    # ---------- Jobs ----------
+    @app.post("/api/jobs")
+    async def api_jobs_start(
+        request: Request,
+        _: t.Any = Depends(require_auth),
+    ):
+        # Query parameters (we accept in query to make PS simple)
+        params = request.query_params
+        kind = params.get("kind", "all")
+        date = params.get("date")
+        use_redis = params.get("use_redis", "false").lower() in ("1", "true", "yes")
+        retries = int(params.get("retries", "0"))
+        backoff = float(params.get("backoff", "1"))
+
+        if use_redis:
+            if not REDIS_ENABLED:
+                raise HTTPException(400, detail="redis_not_enabled")
+            global EXPORTS_STARTED
+            EXPORTS_STARTED += 1
+            r = _redis.from_url(REDIS_URL)  # type: ignore
+            q = Queue("exports", connection=r)  # type: ignore
+            job = q.enqueue(
+                "satyagrah.web.jobs_api:rq_run_export",
+                kwargs={"kind": kind, "date": date},
+                retry=None,  # simple for now
+            )
+            HISTORY.upsert(
+                id=job.get_id(),
+                backend="redis",
+                kind=kind,
+                status="queued",
+                created_at=time.time(),
+                updated_at=time.time(),
+            )
+            return {"ok": True, "backend": "redis", "job_id": job.get_id()}
+        else:
+            job_id = f"mem_{uuid.uuid4().hex[:10]}"
+            j: MemJob = {
+                "id": job_id,
+                "backend": "memory",
+                "kind": kind,
+                "date": date,
+                "status": "running",
+                "progress": 0.0,
+                "message": "starting",
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "deadline": time.time() + 60 * 10,
+                "attempts": [],
+            }
+            JOBS[job_id] = j
+            HISTORY.upsert(
+                id=j["id"],
+                backend="memory",
+                kind=kind,
+                status="running",
+                created_at=j["created_at"],
+                updated_at=j["updated_at"],
+            )
+            asyncio.create_task(_run_mem_job(j, retries=retries, backoff=backoff))
+            return {"ok": True, "backend": "memory", "job_id": job_id}
+
+    @app.get("/api/jobs/{job_id}")
+    async def api_job_status(job_id: str, _: t.Any = Depends(require_auth)):
+        if job_id in JOBS:
+            j = JOBS[job_id]
+            return {
+                "ok": True,
+                "id": j["id"],
+                "backend": "memory",
+                "kind": j["kind"],
+                "date": j.get("date"),
+                "status": j["status"],
+                "progress": j.get("progress", 0.0),
+                "message": j.get("message", ""),
+                "result": j.get("result", {}),
+                "attempts": j.get("attempts", []),
+                "created_at": j["created_at"],
+                "updated_at": j["updated_at"],
+                "deadline": j["deadline"],
+            }
+        if REDIS_ENABLED:
+            try:
+                r = _redis.from_url(REDIS_URL)  # type: ignore
+                job = RqJob.fetch(job_id, connection=r)  # type: ignore
+                status = job.get_status(refresh=False)
+                res = job.result if status == "finished" else None
+                return {
+                    "ok": True,
+                    "id": job_id,
+                    "backend": "redis",
+                    "kind": "all",
+                    "status": status,
+                    "result": res or {},
+                    "created_at": float(job.created_at.timestamp()) if job.created_at else None,  # type: ignore
+                    "updated_at": time.time(),
+                }
+            except Exception:
+                pass
+        raise HTTPException(404, detail="not_found")
+
+    @app.delete("/api/jobs/{job_id}")
+    async def api_job_cancel(job_id: str, _: t.Any = Depends(require_auth)):
+        if job_id in JOBS:
+            JOBS[job_id]["cancelled"] = True
+            return {"ok": True, "cancelled": True, "backend": "memory"}
+        if REDIS_ENABLED:
+            try:
+                r = _redis.from_url(REDIS_URL)  # type: ignore
+                job = RqJob.fetch(job_id, connection=r)  # type: ignore
+                job.cancel()
+                return {"ok": True, "cancelled": True, "backend": "redis"}
+            except Exception as ex:
+                raise HTTPException(404, detail=f"not_found_or_cancel_failed: {ex}")
+        raise HTTPException(404, detail="not_found")
+
+    @app.get("/api/jobs/{job_id}/events")
+    async def api_job_events(job_id: str, _: t.Any = Depends(require_auth)):
+        async def gen():
+            # Send initial event
+            yield f"data: {json.dumps({'ok': True, 'id': job_id})}\n\n"
+            sent_done = False
+            while True:
+                if job_id in JOBS:
+                    j = JOBS[job_id]
+                    payload = {
+                        "id": j["id"],
+                        "status": j["status"],
+                        "progress": j.get("progress", 0.0),
+                        "message": j.get("message", ""),
+                    }
+                    if j["status"] in {"done", "failed", "cancelled"}:
+                        payload["result"] = j.get("result", {})
+                        sent_done = True
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    if sent_done:
+                        break
+                else:
+                    # For Redis, fall back to polling once
+                    if REDIS_ENABLED:
+                        with contextlib.suppress(Exception):
+                            r = _redis.from_url(REDIS_URL)  # type: ignore
+                            job = RqJob.fetch(job_id, connection=r)  # type: ignore
+                            payload = {"id": job_id, "status": job.get_status()}
+                            if job.is_finished:
+                                payload["result"] = job.result or {}
+                                yield f"data: {json.dumps(payload)}\n\n"
+                                break
+                            yield f"data: {json.dumps(payload)}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'ok': False, 'error': 'not_found'})}\n\n"
+                        break
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    # ---------- Files ----------
+    @app.get("/api/files")
+    async def api_files(limit: int = 20, offset: int = 0, _: t.Any = Depends(require_auth)):
+        # Collect all files under exports (flat listing)
+        files: list[dict] = []
+        for p in sorted(EXPORTS.rglob("*")):
+            if p.is_file():
+                try:
+                    stat = p.stat()
+                    files.append({"path": str(p), "size": stat.st_size, "mtime": stat.st_mtime})
+                except Exception:
+                    continue
+        total = len(files)
+        items = files[offset : offset + limit]
+        return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+    @app.post("/api/files/cleanup")
+    async def api_files_cleanup(older_than_days: int = 60, _: t.Any = Depends(require_auth)):
+        cutoff = time.time() - older_than_days * 86400
+        removed_dirs = 0
+        for day_dir in EXPORTS.iterdir():
+            if not day_dir.is_dir():
+                continue
+            # If newest file is older than cutoff, remove the whole folder
+            newest = 0.0
+            for f in day_dir.rglob("*"):
+                with contextlib.suppress(Exception):
+                    newest = max(newest, f.stat().st_mtime)
+            if newest and newest < cutoff:
+                with contextlib.suppress(Exception):
+                    for f in sorted(day_dir.rglob("*"), reverse=True):
+                        if f.is_file():
+                            f.unlink(missing_ok=True)  # type: ignore
+                    day_dir.rmdir()
+                    removed_dirs += 1
+        return {"ok": True, "removed_dirs": removed_dirs, "older_than_days": older_than_days}
+
+    # ---------- History ----------
+    @app.get("/api/history")
+    async def api_history(limit: int = 20, offset: int = 0, _: t.Any = Depends(require_auth)):
+        return HISTORY.list(limit=limit, offset=offset)
+
+    # ---------- Metrics ----------
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics():
+        # Queue length for Redis
+        q_redis = 0
+        if REDIS_ENABLED:
+            with contextlib.suppress(Exception):
+                r = _redis.from_url(REDIS_URL)  # type: ignore
+                q = Queue("exports", connection=r)  # type: ignore
+                q_redis = q.count
+        q_mem = sum(1 for j in JOBS.values() if j["status"] == "running")
+
+        lines = [
+            "# HELP exports_started_total Number of exports started",
+            "# TYPE exports_started_total counter",
+            f"exports_started_total {EXPORTS_STARTED}",
+            "# HELP exports_succeeded_total Number of exports succeeded",
+            "# TYPE exports_succeeded_total counter",
+            f"exports_succeeded_total {EXPORTS_SUCCEEDED}",
+            "# HELP exports_failed_total Number of exports failed",
+            "# TYPE exports_failed_total counter",
+            f"exports_failed_total {EXPORTS_FAILED}",
+            "# HELP export_duration_seconds_sum Sum of durations",
+            "# TYPE export_duration_seconds_sum counter",
+            f"export_duration_seconds_sum {EXPORT_DUR_SUM}",
+            "# HELP export_duration_seconds_count Count of durations",
+            "# TYPE export_duration_seconds_count counter",
+            f"export_duration_seconds_count {EXPORT_DUR_COUNT}",
+            "# HELP export_queue_length jobs pending in queue (redis+memory)",
+            "# TYPE export_queue_length gauge",
+            "export_queue_length{backend='redis'} " + str(q_redis),
+            "export_queue_length{backend='memory'} " + str(q_mem),
+        ]
+        return "\n".join(lines) + "\n"
+
+    # ---------- Tiny UI ----------
+    _UI_HTML = """
+<!doctype html><html><head><meta charset="utf-8"/>
+<title>Exporter</title>
+<style>
+body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;background:#0f1115;color:#e8e8e8;margin:24px}
+.row{margin:12px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input,button{padding:8px 10px;border-radius:8px;border:1px solid #333;background:#171a21;color:#e8e8e8}
+button{cursor:pointer}button:hover{background:#1f2430}
+pre{background:#0b0d12;padding:12px;border-radius:10px;overflow:auto;min-height:240px}
+.pill{background:#131722;padding:6px 10px;border-radius:999px;border:1px solid #222;font-size:12px}
+.muted{color:#9aa4b2}
+</style></head>
+<body>
+<h1>Exporter</h1>
+<div class="row"><span class="pill">Token:</span>
+<input id="tok" placeholder="x-auth token" size="40"/><button onclick="saveTok()">Save</button>
+<span class="muted">(stored in localStorage)</span></div>
+<div class="row">
+<button onclick="exportAll()">Export All (in-process)</button>
+<button onclick="enqueue()">Export All (Job via Redis)</button>
+<input id="jid" placeholder="job id" size="28"/>
+<button onclick="status()">Job Status</button>
+<button onclick="cancel()">Cancel Job</button>
+</div>
+<div class="row">
+<button onclick="listFiles()">List Latest Files</button>
+<button onclick="cleanup()">Cleanup Files ≥60d</button>
+<button onclick="showConfig()">Show Config</button>
+<button onclick="metrics()">Metrics</button>
+</div>
+<pre id="out">{ "ok": true, "hint": "set your token then click a button" }</pre>
+<script>
+const B = location.origin; const $ = (id)=>document.getElementById(id);
+function tok(){ return $('tok').value.trim(); }
+function hdr(){ return { 'x-auth': tok() || '' }; }
+function saveTok(){ localStorage.setItem('exporter_token', tok()); log({ok:true, saved:true}); }
+function loadTok(){ $('tok').value = localStorage.getItem('exporter_token') || ''; }
+function log(x){ $('out').textContent = (typeof x === 'string') ? x : JSON.stringify(x, null, 2); }
+
+async function exportAll(){
+  const r = await fetch(`${B}/api/export/all`, {method:'POST', headers:{...hdr(),'content-type':'application/json'}, body:'{}'});
+  log(await r.json());
+}
+async function enqueue(){
+  const r = await fetch(`${B}/api/jobs?kind=all&use_redis=true&retries=2&backoff=1`, {method:'POST', headers:hdr()});
+  const j = await r.json(); log(j); if(j.job_id){ $('jid').value = j.job_id; }
+}
+async function status(){
+  const id = $('jid').value.trim(); if(!id) return log({ok:false,error:'no job id'});
+  const r = await fetch(`${B}/api/jobs/${encodeURIComponent(id)}`, {headers:hdr()}); log(await r.json());
+}
+async function cancel(){
+  const id = $('jid').value.trim(); if(!id) return log({ok:false,error:'no job id'});
+  const r = await fetch(`${B}/api/jobs/${encodeURIComponent(id)}`, {method:'DELETE', headers:hdr()}); log(await r.json());
+}
+async function listFiles(){ const r = await fetch(`${B}/api/files?limit=10&offset=0`, {headers:hdr()}); log(await r.json()); }
+async function cleanup(){ const r = await fetch(`${B}/api/files/cleanup?older_than_days=60`, {method:'POST', headers:hdr()}); log(await r.json()); }
+async function showConfig(){ const r = await fetch(`${B}/api/config`, {headers:hdr()}); log(await r.json()); }
+async function metrics(){ const r = await fetch(`${B}/metrics`, {headers:hdr()}); log(await r.text()); }
+loadTok();
+</script></body></html>
+"""
+    @app.get("/ui/exporter", response_class=HTMLResponse)
+    async def ui_exporter():
+        return _UI_HTML
+
+    return app
+
+
+app = create_app()
+
+def do_export_all(date_str: str | None = None) -> dict:
+    """
+    Real export powered by reportlab/python-pptx via satyagrah.exporter.build_all_exports.
+    """
+    import datetime as _dt
+    from pathlib import Path as _Path
+    when = _dt.date.fromisoformat(date_str) if date_str else None
+    root = _Path(__file__).resolve().parents[2]
+    return build_all_exports(root, when)
+

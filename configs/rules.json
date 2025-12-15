@@ -1,0 +1,9 @@
+{
+  "telegram": [
+    { "any": ["#india", "#indiapolitics", "karur", "stampede", "probe", "police", "award"] }
+  ],
+  "instagram": [
+    { "hashtags_contains": ["#newdelhi", "#mumbai", "#delhi"] },
+    { "any": ["award", "rally", "tragedy"] }
+  ]
+}

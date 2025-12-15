@@ -1,0 +1,34 @@
+﻿<!doctype html><meta charset="utf-8"/>
+<title>History</title>
+<style>
+ body{background:#0b0e12;color:#e7e9ee;font:14px system-ui;margin:28px}
+ table{border-collapse:collapse;width:100%} td,th{border:1px solid #1d2536;padding:8px}
+ input,button{padding:6px 9px;border-radius:10px;border:1px solid #263040;background:#121722;color:#e7e9ee}
+</style>
+<h2>History</h2>
+<div>
+ Token <input id="t" style="min-width:260px"> 
+ <button onclick="save()">Save</button> 
+ <button onclick="load()">Load</button>
+</div>
+<table id="tbl"><thead>
+<tr><th>id</th><th>status</th><th>kind</th><th>created</th><th>updated</th></tr>
+</thead><tbody></tbody></table>
+<script>
+const BASE=location.origin;
+t.value=localStorage.token||"";
+function save(){localStorage.token=t.value}
+function hdr(){return {"x-auth":localStorage.token||""}}
+async function load(){
+ const r=await fetch(BASE+"/api/history?limit=100&offset=0",{headers:hdr()});
+ const j=await r.json(); const tb=document.querySelector("#tbl tbody"); tb.innerHTML="";
+ if(j.items) j.items.forEach(x=>{
+  const tr=document.createElement("tr");
+  tr.innerHTML=`<td>${x.id}</td><td>${x.status}</td><td>${x.kind}</td>
+  <td>${new Date(x.created_at*1000).toLocaleString()}</td>
+  <td>${new Date(x.updated_at*1000).toLocaleString()}</td>`;
+  tb.appendChild(tr);
+ });
+}
+load();
+</script>

@@ -1,0 +1,180 @@
+# D:\AISatyagrah\satyagrah\web\jobs_store.py
+from __future__ import annotations
+import os, json, sqlite3, threading, time
+from typing import Any, Dict, List, Optional, Tuple
+
+SCHEMA_VERSION = 1
+
+class JobsStore:
+    """
+    SQLite-backed job store with simple migrations.
+    Tables:
+      - jobs(id TEXT PK, backend, kind, status, date, created_at REAL, updated_at REAL,
+             retries INT, error TEXT, result_json TEXT)
+      - job_events(id INTEGER PK AUTOINCREMENT, job_id TEXT, ts REAL, level TEXT, message TEXT)
+
+    Indexes on jobs(updated_at), jobs(status), jobs(kind).
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = os.path.abspath(db_path)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._conn:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._migrate()
+
+    # ---------- migrations ----------
+    def _get_user_version(self) -> int:
+        row = self._conn.execute("PRAGMA user_version").fetchone()
+        return int(list(row)[0]) if row is not None else 0
+
+    def _set_user_version(self, v: int) -> None:
+        self._conn.execute(f"PRAGMA user_version={int(v)}")
+
+    def _migrate(self) -> None:
+        with self._lock, self._conn:
+            uv = self._get_user_version()
+            if uv < 1:
+                self._conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS jobs(
+                      id          TEXT PRIMARY KEY,
+                      backend     TEXT,
+                      kind        TEXT,
+                      status      TEXT,
+                      date        TEXT,
+                      created_at  REAL,
+                      updated_at  REAL,
+                      retries     INTEGER DEFAULT 0,
+                      error       TEXT,
+                      result_json TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at);
+                    CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
+                    CREATE INDEX IF NOT EXISTS idx_jobs_kind    ON jobs(kind);
+
+                    CREATE TABLE IF NOT EXISTS job_events(
+                      id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                      job_id  TEXT,
+                      ts      REAL,
+                      level   TEXT,
+                      message TEXT
+                    );
+                    """
+                )
+                self._set_user_version(1)
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _now() -> float:
+        return time.time()
+
+    @staticmethod
+    def _json(d: Optional[Dict[str, Any]]) -> Optional[str]:
+        return None if d is None else json.dumps(d, ensure_ascii=False)
+
+    @staticmethod
+    def _dejson(s: Optional[str]) -> Optional[Dict[str, Any]]:
+        return None if not s else json.loads(s)
+
+    def _row_to_job(self, r: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": r["id"],
+            "backend": r["backend"],
+            "kind": r["kind"],
+            "status": r["status"],
+            "date": r["date"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "retries": r["retries"],
+            "error": r["error"],
+            "result": self._dejson(r["result_json"]),
+        }
+
+    # ---------- API ----------
+    def create(self, job_id: str, backend: str, kind: str, date: Optional[str] = None,
+               status: str = "queued", result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        now = self._now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO jobs(id, backend, kind, status, date, created_at, updated_at, retries, error, result_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (job_id, backend, kind, date, now, now, self._json(result))
+            )
+        return self.get(job_id)
+
+    def upsert_status(self, job_id: str, status: str,
+                      result: Optional[Dict[str, Any]] = None,
+                      error: Optional[str] = None,
+                      retries: Optional[int] = None) -> Dict[str, Any]:
+        sets = ["status = ?", "updated_at = ?"]
+        args: List[Any] = [status, self._now()]
+        if result is not None:
+            sets.append("result_json = ?"); args.append(self._json(result))
+        if error is not None:
+            sets.append("error = ?"); args.append(error)
+        if retries is not None:
+            sets.append("retries = ?"); args.append(int(retries))
+        args.extend([job_id])
+        with self._lock, self._conn:
+            self._conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", args)
+        return self.get(job_id)
+
+    def get(self, job_id: str) -> Dict[str, Any]:
+        with self._lock:
+            r = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not r:
+            return {"ok": False, "error": "not_found", "id": job_id}
+        return {"ok": True, "item": self._row_to_job(r)}
+
+    def delete(self, job_id: str) -> bool:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM job_events WHERE job_id = ?", (job_id,))
+            cur = self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        return cur.rowcount > 0
+
+    def list(self, limit: int = 20, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs ORDER BY updated_at DESC LIMIT ? OFFSET ?", (int(limit), int(offset))
+            ).fetchall()
+            total = self._conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+        return [self._row_to_job(r) for r in rows], int(total)
+
+    def add_event(self, job_id: str, message: str, level: str = "info") -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO job_events(job_id, ts, level, message) VALUES(?, ?, ?, ?)",
+                (job_id, self._now(), level, message)
+            )
+
+    def list_events(self, job_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM job_events WHERE job_id=? ORDER BY ts DESC LIMIT ?",
+                (job_id, int(limit))
+            ).fetchall()
+        return [dict(id=r["id"], job_id=r["job_id"], ts=r["ts"], level=r["level"], message=r["message"]) for r in rows]
+
+    # Optional convenience for export endpoint hooks
+    def record_export_started(self, job_id: str, backend: str, kind: str, date: Optional[str] = None) -> None:
+        self.create(job_id, backend=backend, kind=kind, date=date, status="running")
+        self.add_event(job_id, "export started")
+
+    def record_export_progress(self, job_id: str, msg: str) -> None:
+        self.add_event(job_id, msg)
+
+    def record_export_finished(self, job_id: str, result: Dict[str, Any]) -> None:
+        self.upsert_status(job_id, status="done", result=result)
+        self.add_event(job_id, "export complete")
+
+    def record_export_failed(self, job_id: str, err: str) -> None:
+        self.upsert_status(job_id, status="failed", error=err)
+        self.add_event(job_id, f"export failed: {err}")

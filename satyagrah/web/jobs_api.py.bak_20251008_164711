@@ -1,0 +1,379 @@
+﻿# satyagrah/web/jobs_api.py
+# Minimal export UI + simple exporters (ZIP & CSV real; others are placeholders)
+
+from __future__ import annotations
+import base64
+import csv
+import datetime as dt
+import io
+import os
+import zipfile
+from typing import List, Dict, Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.staticfiles import StaticFiles
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DATA = os.path.join(ROOT, "data")
+RUNS = os.path.join(DATA, "runs")
+EXPORTS = os.path.join(ROOT, "exports")
+os.makedirs(DATA, exist_ok=True)
+os.makedirs(RUNS, exist_ok=True)
+os.makedirs(EXPORTS, exist_ok=True)
+
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "mysupersecrettoken")
+
+def _today() -> str:
+    return dt.date.today().isoformat()
+
+def _art_dir(date: str) -> str:
+    return os.path.join(RUNS, date, "art")
+
+def _exports_dir(date: str) -> str:
+    return os.path.join(EXPORTS, date)
+
+def _ensure_dirs(date: str) -> None:
+    os.makedirs(_art_dir(date), exist_ok=True)
+    os.makedirs(_exports_dir(date), exist_ok=True)
+
+def _list_images(date: str) -> List[Dict[str, Any]]:
+    d = _art_dir(date)
+    out: List[Dict[str, Any]] = []
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            if name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                p = os.path.join(d, name)
+                out.append({
+                    "name": name,
+                    "path": p,
+                    "size": os.path.getsize(p),
+                    "web": f"/files/data/runs/{date}/art/{name}",
+                })
+    return out
+
+def _list_results(date: str) -> List[Dict[str, Any]]:
+    d = _exports_dir(date)
+    out: List[Dict[str, Any]] = []
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            out.append({
+                "name": name,
+                "size": os.path.getsize(p),
+                "web": f"/files/exports/{date}/{name}",
+            })
+    return out
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="AISatyagrah — Export Queue")
+    app.mount("/files", StaticFiles(directory=ROOT), name="files")
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        # Only protect POST API calls; UI and GETs stay open
+        if request.method == "POST" and request.url.path.startswith("/api/"):
+            if request.headers.get("x-auth") != AUTH_TOKEN:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def home():
+        today = _today()
+        return HTML_PAGE.replace("{{TODAY}}", today)
+
+    @app.get("/api/images")
+    async def api_images(date: str):
+        return {"value": _list_images(date), "Count": len(_list_images(date))}
+
+    @app.get("/api/results")
+    async def api_results(date: str):
+        return {"value": _list_results(date), "Count": len(_list_results(date))}
+
+    @app.post("/api/worker/drain")
+    async def api_worker_drain():
+        # stub – pipeline idea kept for compatibility
+        return {"ok": True, "iterations": 0, "remaining": 0}
+
+    @app.post("/api/sample")
+    async def api_sample(request: Request):
+        payload = await request.json()
+        date = payload.get("date") or _today()
+        _ensure_dirs(date)
+        # two tiny, valid PNGs from base64 to avoid Pillow/reportlab deps
+        png1 = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAA8AAAAPCAYAAAA71pVKAAAAPUlEQVQoU2NkwAT/GZiB"
+            "gQGJgQkY/8MwkAQUJv4HxgYGL0QGgSkA0g2A8S0g6g0SlwShC9kM0AANu5B6aH7l2wAAAABJRU5ErkJggg==")
+        png2 = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAA8AAAAPCAYAAAA71pVKAAAAQElEQVQoU2NkwAT/GZiB"
+            "gQGJgQkY/8MwMDDA8P9/f0YGBmYgBqkmQHSDYDxLSDqDRKXBKEL2QzQAAx1oF+u1bE9cAAAAASUVORK5CYII=")
+        open(os.path.join(_art_dir(date), "sample.png"), "wb").write(png1)
+        open(os.path.join(_art_dir(date), "sample.jpg"), "wb").write(png2)
+        return {"ok": True, "date": date, "created": [
+            os.path.join(_art_dir(date), "sample.png"),
+            os.path.join(_art_dir(date), "sample.jpg"),
+        ]}
+
+    @app.post("/api/export")
+    async def api_export(request: Request):
+        """
+        JSON body:
+          {
+            "date": "yyyy-mm-dd",
+            "kind": "zip|csv|pdf|pptx|gif|mp4",
+            "files": ["a.jpg","b.png"],
+            "mp4_fps": 1.8,
+            "gif_ms": 110
+          }
+        """
+        data = await request.json()
+        date = data.get("date") or _today()
+        kind = (data.get("kind") or "").lower()
+        files = data.get("files") or []
+        mp4_fps = float(data.get("mp4_fps") or 1.8)
+        gif_ms = int(data.get("gif_ms") or 110)
+
+        _ensure_dirs(date)
+        art = _art_dir(date)
+        outdir = _exports_dir(date)
+
+        # normalize selection (allow "all")
+        if not files or files == ["*"]:
+            files = [x["name"] for x in _list_images(date)]
+
+        # full paths to include
+        paths = [os.path.join(art, f) for f in files if os.path.isfile(os.path.join(art, f))]
+
+        if not paths:
+            return JSONResponse({"ok": False, "error": "No files to export."}, status_code=400)
+
+        if kind == "zip":
+            out = os.path.join(outdir, "images.zip")
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+                for p in paths:
+                    z.write(p, arcname=os.path.basename(p))
+            return {"ok": True, "file": f"/files/exports/{date}/images.zip"}
+
+        if kind == "csv":
+            out = os.path.join(outdir, "list.csv")
+            with open(out, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["name", "size_bytes", "web"])
+                for p in paths:
+                    nm = os.path.basename(p)
+                    w.writerow([nm, os.path.getsize(p), f"/files/data/runs/{date}/art/{nm}"])
+            return {"ok": True, "file": f"/files/exports/{date}/list.csv"}
+
+        # placeholders for now – we can wire real renderers later
+        placeholder = {
+            "pdf": "contact_sheet.pdf",
+            "pptx": "export.pptx",
+            "gif": "export.gif",
+            "mp4": "export.mp4",
+        }.get(kind)
+        if placeholder:
+            out = os.path.join(outdir, placeholder)
+            with open(out, "wb") as f:
+                f.write(f"{kind.upper()} placeholder for {len(paths)} image(s). "
+                        f"mp4_fps={mp4_fps} gif_ms={gif_ms}\n".encode("utf-8"))
+            return {"ok": True, "file": f"/files/exports/{date}/{placeholder}", "note": "placeholder"}
+
+        return JSONResponse({"ok": False, "error": f"Unknown kind: {kind}"}, status_code=400)
+
+    return app
+
+
+HTML_PAGE = r"""
+<!doctype html>
+<meta charset="utf-8"/>
+<title>AISatyagrah — Export Queue</title>
+<style>
+  :root { --bg:#0f1012; --fg:#e7ebf0; --mut:#9aa3ad; --btn:#262a30; --sel:#2b5cff; }
+  body { background:var(--bg); color:var(--fg); font:16px/1.4 system-ui,Segoe UI,Roboto,Arial,sans-serif; padding:28px 32px; }
+  h1 { font-weight:800; letter-spacing:.3px; margin:0 0 20px; font-size:34px}
+  .mut { color:var(--mut); }
+  .row { display:flex; gap:12px; align-items:center; margin-bottom:22px; flex-wrap:wrap }
+  input, button { background:var(--btn); color:var(--fg); border:1px solid #3a3f47; border-radius:10px; padding:10px 14px; }
+  button { cursor:pointer; }
+  button:hover { border-color:#4a515a }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(260px,1fr)); gap:12px; }
+  .tile { border:1px solid #3a3f47; border-radius:12px; padding:14px; cursor:pointer; }
+  .tile .name { font-weight:700 }
+  .tile.selected { outline:3px solid var(--sel); }
+  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0 18px; }
+  .sp { color:var(--mut); margin:0 8px }
+  table { width:100%; border-collapse:collapse; margin-top:20px}
+  th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #24272d; color:var(--fg) }
+  a { color:#7db3ff; text-decoration:none }
+</style>
+
+<h1>AISatyagrah — Export Queue <span class="mut">(auth: <span id="authState">off</span>)</span></h1>
+
+<div class="row">
+  <label>Date:
+    <input type="date" id="date" value="{{TODAY}}">
+  </label>
+  <button id="btnSample">Make Sample Run</button>
+  <button id="btnDrain">Worker Drain</button>
+  <button id="btnSetToken" class="b">Set Token</button>
+</div>
+
+<h2>Gallery (today)</h2>
+
+<div class="toolbar">
+  <button id="selAll">Select All</button>
+  <button id="selClear">Clear</button>
+  <span class="sp">| Export selected →</span>
+  <label>MP4 fps <input id="mp4fps" type="number" step="0.1" value="1.8" style="width:80px"></label>
+  <label>GIF ms/frame <input id="gifms" type="number" step="10" value="110" style="width:90px"></label>
+  <button id="expPDF">PDF</button>
+  <button id="expPPTX">PPTX</button>
+  <button id="expGIF">GIF</button>
+  <button id="expMP4">MP4</button>
+  <button id="expCSV">CSV</button>
+  <button id="expZIP">ZIP</button>
+</div>
+
+<div id="gallery" class="grid"></div>
+
+<h2 style="margin-top:28px">Results (today)</h2>
+<table id="resultsTbl">
+  <thead><tr><th>file</th><th>size</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const $ = (q)=>document.querySelector(q);
+const dateEl = $("#date");
+const gal = $("#gallery");
+const resBody = $("#resultsTbl tbody");
+let token = localStorage.getItem("xauth") || "";
+let selected = new Set();
+
+function authOn() { $("#authState").textContent = token ? "on" : "off"; }
+
+function api(path, opts={}){
+  opts.headers = opts.headers || {};
+  if (token) opts.headers["x-auth"] = token;
+  return fetch(path, opts);
+}
+
+async function refresh(){
+  selected.clear();
+  const d = dateEl.value;
+  const imgs = await (await fetch(`/api/images?date=${d}`)).json();
+  const res  = await (await fetch(`/api/results?date=${d}`)).json();
+  gal.innerHTML = "";
+  (imgs.value || []).forEach(it=>{
+    const div = document.createElement("div");
+    div.className = "tile";
+    div.dataset.name = it.name;
+    div.innerHTML = `<div class="name">${it.name}</div><div class="mut">${(it.size||0)} bytes</div>`;
+    div.onclick = ()=>{ div.classList.toggle("selected");
+      if (div.classList.contains("selected")) selected.add(it.name); else selected.delete(it.name);
+    };
+    gal.appendChild(div);
+  });
+  resBody.innerHTML = "";
+  (res.value || []).forEach(r=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td><a href="${r.web}" target="_blank">${r.name}</a></td><td>${r.size}</td>`;
+    resBody.appendChild(tr);
+  });
+}
+
+function selectedList(){
+  return [...selected];
+}
+
+async function exportKind(kind){
+  const files = selected.size ? selectedList() : ["*"];
+  const body = {
+    date: dateEl.value,
+    kind,
+    files,
+    mp4_fps: parseFloat($("#mp4fps").value || "1.8"),
+    gif_ms: parseInt($("#gifms").value || "110")
+  };
+  const r = await api("/api/export", {
+    method:"POST",
+    headers:{ "content-type":"application/json" },
+    body: JSON.stringify(body)
+  });
+  if(!r.ok){
+    const t = await r.text();
+    alert(`Export failed: ${t}`);
+  }else{
+    const j = await r.json();
+    if(j.file) alert(`Created: ${j.file}${j.note ? " ("+j.note+")":""}`);
+  }
+  refresh();
+}
+
+$("#btnSample").onclick = async ()=>{
+  const d=dateEl.value;
+  await api("/api/sample",{method:"POST",headers:{'content-type':'application/json'},body:JSON.stringify({date:d})});
+  refresh();
+};
+$("#btnDrain").onclick = async ()=>{ await api("/api/worker/drain",{method:"POST"}); alert("Worker drained (stub)."); };
+$("#btnToken").onclick = ()=>{
+  const v = prompt("Set x-auth token (empty to clear):", token||"");
+  token = v||"";
+  if(token) localStorage.setItem("xauth", token); else localStorage.removeItem("xauth");
+  authOn();
+};
+
+$("#selAll").onclick   = ()=>{ document.querySelectorAll(".tile").forEach(t=>{ t.classList.add("selected"); selected.add(t.dataset.name); }); };
+$("#selClear").onclick = ()=>{ document.querySelectorAll(".tile").forEach(t=>t.classList.remove("selected")); selected.clear(); };
+
+$("#expPDF").onclick  = ()=>exportKind("pdf");
+$("#expPPTX").onclick = ()=>exportKind("pptx");
+$("#expGIF").onclick  = ()=>exportKind("gif");
+$("#expMP4").onclick  = ()=>exportKind("mp4");
+$("#expCSV").onclick  = ()=>exportKind("csv");
+$("#expZIP").onclick  = ()=>exportKind("zip");
+
+authOn();
+refresh();
+</script>
+"""
+
+# allow running with "uvicorn satyagrah.web.jobs_api:app ..."
+app = create_app()
+
+
+# ---- export endpoint (simple) ----
+from pydantic import BaseModel
+from pathlib import Path
+
+class ExportReq(BaseModel):
+    date: str
+    files: list[str]
+    mp4_fps: float | None = None
+    gif_ms: int  | None = None
+
+@app.post("/api/export/{kind}")
+def api_export(kind: str, req: ExportReq, request: Request):
+    # optional auth
+    reqtok = request.headers.get("x-auth", "")
+    if AUTH_TOKEN and reqtok != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    date = (req.date or today()).strip()
+    kind = kind.lower()
+    # where to drop an artifact
+    outdir = Path("exports") / date
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # write a tiny artifact so we can see the pipeline working
+    out = outdir / f"export.{kind}"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(f"kind={kind}\n")
+        f.write(f"date={date}\n")
+        f.write(f"files={req.files}\n")
+        f.write(f"mp4_fps={req.mp4_fps}\n")
+        f.write(f"gif_ms={req.gif_ms}\n")
+
+    # also expose under /files for quick clicking (optional)
+    return {"ok": True, "message": f"Created {out.as_posix()}", "web": f"/files/{out.as_posix().replace('\\','/')}"}
+# ---- /export endpoint ----

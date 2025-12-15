@@ -1,0 +1,585 @@
+﻿from __future__ import annotations
+
+import os
+import json
+import datetime as _dt
+from pathlib import Path
+from typing import Optional, Any, Dict, List
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# ---- internal app imports (must exist in your project) ----
+from ..models.db import ensure_db, list_jobs, list_results
+from ..services.worker import enqueue_export_job, run_worker_once
+
+# ---- paths ----
+ROOT = Path(__file__).resolve().parents[2]          # repo root
+DB_PATH = ROOT / "state.db"
+EXPORTS = ROOT / "exports"
+EXPORTS.mkdir(parents=True, exist_ok=True)
+
+# We mount the whole repo at /data so UI can link to /data/data/runs/<date>/art/<img>
+DATA_MOUNT_ROOT = ROOT
+
+# ---- optional auth ----
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+
+def _today() -> str:
+    return _dt.date.today().isoformat()
+
+def _require_auth(request: Request):
+    if not AUTH_TOKEN:
+        return
+    if request.headers.get("x-auth", "") != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ---- pydantic models ----
+class ExportReq(BaseModel):
+    date: Optional[str] = None
+    args: Optional[Dict[str, Any]] = None
+
+class ExportSelectedReq(BaseModel):
+    date: Optional[str] = None
+    files: List[str]
+    args: Optional[Dict[str, Any]] = None
+
+class CaptionReq(BaseModel):
+    date: str
+    path: str
+    caption: Optional[str] = ""
+    tags: Optional[str] = ""
+
+# ---- app ----
+app = FastAPI(title="AISatyagrah Jobs API")
+
+# static mounts
+app.mount("/exports", StaticFiles(directory=str(EXPORTS)), name="exports")
+app.mount("/data", StaticFiles(directory=str(DATA_MOUNT_ROOT)), name="data")
+
+# ----------------------------- UI ---------------------------------
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    # Keep this a raw triple-quoted string (no f-strings)
+    return """<!doctype html>
+<html lang='en'>
+<meta charset='utf-8'/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AISatyagrah — Export Queue</title>
+<style>
+:root{color-scheme:dark light}
+*{box-sizing:border-box}
+body{font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;background:#111;color:#eee}
+h1{font-size:22px;margin:0 0 12px}
+h3{margin:18px 0 8px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+input,button,select{padding:8px 10px;border-radius:10px;border:1px solid #333;background:#1e1e1e;color:#eee}
+input[type=number]{width:80px}
+button{cursor:pointer}
+button.primary{background:#2b6cb0}
+button:disabled{opacity:.6;cursor:not-allowed}
+.small{font-size:12px;opacity:.8}
+table{border-collapse:collapse;width:100%;margin-top:10px}
+th,td{border-bottom:1px solid #2a2a2a;padding:8px;text-align:left;font-variant-numeric:tabular-nums}
+a{color:#7ecbff;text-decoration:none}
+a:hover{text-decoration:underline}
+.badge{display:inline-block;background:#222;border:1px solid #333;border-radius:12px;padding:3px 8px;margin-left:6px;font-size:12px}
+#toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:1000}
+.toast{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:10px;padding:10px 12px;box-shadow:0 4px 12px rgb(0 0 0 / .4)}
+.toast.ok{border-color:#2e7d32}
+.toast.err{border-color:#c62828}
+#gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px}
+.tile{position:relative;border:2px solid #282828;border-radius:12px;overflow:hidden;background:#000;cursor:pointer;min-height:160px}
+.tile img{width:100%;height:100%;object-fit:cover;display:block}
+.tile .pick{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.55);border:1px solid #444;padding:2px 8px;border-radius:20px;font-size:12px}
+.tile.selected{outline:3px solid #3b82f6;border-color:#3b82f6}
+#selection{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+.sel{width:240px;height:160px;border:2px dashed #333;border-radius:12px;overflow:hidden;background:#000;position:relative}
+.sel img{width:100%;height:100%;object-fit:cover}
+.sel .idx{position:absolute;left:8px;top:8px;background:#000a;border:1px solid #444;padding:1px 6px;border-radius:16px;font-size:12px}
+.grid2{display:grid;grid-template-columns:1.2fr .9fr;gap:16px;margin-top:12px}
+.panel{border:1px solid #2a2a2a;border-radius:12px;padding:10px;background:#151515}
+label.ln{display:block;margin:6px 0 4px}
+textarea{width:100%;min-height:140px;border-radius:10px;border:1px solid #333;background:#1a1a1a;color:#eee;padding:10px}
+.preview{background:#0a0a0a;border-radius:12px;border:1px solid #222;padding:10px}
+.preview img{max-width:100%;display:block;border-radius:10px}
+@media (max-width:1100px){.grid2{grid-template-columns:1fr}}
+</style>
+
+<body>
+<h1>AISatyagrah — Export Queue <span class="small badge" id="authNote"></span></h1>
+
+<div class="row">
+  <label>Date <input id="date" type="date"/></label>
+  <button onclick="queue('pdf')">Queue PDF</button>
+  <button onclick="queue('csv')">Queue CSV</button>
+  <button onclick="queue('pptx')">Queue PPTX</button>
+  <button onclick="queue('gif')">Queue GIF</button>
+  <button onclick="queue('mp4')">Queue MP4</button>
+  <button onclick="queue('zip')">Queue ZIP</button>
+  <button onclick="queueAll()">Queue All</button>
+  <button onclick="tick()">Worker Tick</button>
+  <button onclick="retryFailed()">Retry Failed</button>
+  <button onclick="drain()">Drain Queue</button>
+  <button onclick="sample()">Make Sample Run</button>
+  <button onclick="setToken()">Set Token</button>
+</div>
+
+<h3>Jobs</h3>
+<table id="jobs">
+  <thead><tr>
+    <th>id</th><th>date</th><th>kind</th><th>status</th>
+    <th>created</th><th>finished</th><th>error</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<h3>Results (today)</h3>
+<table id="results">
+  <thead><tr>
+    <th>id</th><th>job_id</th><th>kind</th><th>file</th><th>size</th><th>created</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<h3>Gallery (today)</h3>
+<div class="row">
+  <button onclick="selectAll()">Select All</button>
+  <button onclick="clearSel()">Clear</button>
+  <span>| Export selected →</span>
+  <span> MP4 fps <input id="mp4fps" type="number" step="0.1" value="1.8"/></span>
+  <span> GIF ms/frame <input id="gifms" type="number" step="5" value="110"/></span>
+  <button onclick="exportSel('pdf')">PDF</button>
+  <button onclick="exportSel('pptx')">PPTX</button>
+  <button onclick="exportSel('gif')">GIF</button>
+  <button onclick="exportSel('mp4')">MP4</button>
+  <button onclick="exportSel('csv')">CSV</button>
+  <button onclick="exportSel('zip')">ZIP</button>
+</div>
+<div id="gallery"></div>
+
+<h3>Selection (drag to reorder)</h3>
+<div id="selection"></div>
+
+<div class="grid2">
+  <div class="panel">
+    <div class="small ln">Selected image: <b id="selName">(none)</b></div>
+    <label class="ln">Caption</label>
+    <textarea id="capText" placeholder="Write a short caption..."></textarea>
+    <label class="ln">Hashtags</label>
+    <input id="tagInput" value="#tag1 #tag2"/>
+    <div class="row" style="margin-top:10px">
+      <button onclick="useSuggestion()">Use suggestion</button>
+      <button onclick="saveCaption()">Save Caption</button>
+      <button onclick="clearCaption()">Clear for this image</button>
+    </div>
+    <div class="small" id="capStatus"></div>
+  </div>
+  <div class="preview panel">
+    <div class="small ln">Preview</div>
+    <img id="prevImg" alt="preview"/>
+    <div class="small">Saved to: data/runs/&lt;date&gt;/captions.json</div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+const API = location.origin;
+
+// ----- auth header -----
+function hdrs(){
+  const h = {'Content-Type':'application/json'};
+  const tok = localStorage.getItem('saty_token') || '';
+  if(tok) h['x-auth'] = tok;
+  return h;
+}
+function setToken(){
+  const v = prompt("Set x-auth token (empty to clear):", localStorage.getItem('saty_token') || "");
+  if(v !== null){ localStorage.setItem('saty_token', v.trim()); authNote(); toast("Token updated"); }
+}
+function authNote(){
+  const tok = localStorage.getItem('saty_token') || '';
+  const el = document.getElementById('authNote');
+  el.textContent = tok ? "auth: on" : "auth: off";
+}
+
+// ----- utils -----
+function todayStr(){
+  const d = new Date(), z = d.getTimezoneOffset()*60000;
+  return (new Date(Date.now()-z)).toISOString().slice(0,10);
+}
+function getDate(){ return document.getElementById('date').value || todayStr(); }
+function toast(msg, ok=true){
+  const wrap = document.getElementById('toasts');
+  const div = document.createElement('div');
+  div.className = 'toast ' + (ok ? 'ok':'err');
+  div.textContent = msg;
+  wrap.appendChild(div);
+  setTimeout(()=>div.remove(), 2400);
+}
+
+// ----- jobs/results -----
+async function refresh(){
+  const date = getDate();
+  // jobs
+  const jobs = await (await fetch(`${API}/api/jobs?limit=50&date=${date}`, {headers: hdrs()})).json();
+  const jb = document.querySelector('#jobs tbody'); jb.innerHTML = '';
+  for(const r of jobs){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.id}</td><td>${r.date||''}</td><td>${r.kind||''}</td><td>${r.status||''}</td>
+      <td>${(r.created_at||'').slice(0,19)}</td><td>${(r.finished_at||'').slice(0,19)}</td><td>${r.error?'err':''}</td>`;
+    jb.appendChild(tr);
+  }
+  // results
+  const res = await (await fetch(`${API}/api/results?date=${date}&limit=200`, {headers: hdrs()})).json();
+  const rb = document.querySelector('#results tbody'); rb.innerHTML = '';
+  for(const r of res){
+    let rel = r.path || "";
+    if(rel.includes("\\exports\\")){ rel = "/exports/" + rel.split("\\exports\\").pop(); }
+    else if(rel.includes("/exports/")){ rel = "/exports/" + rel.split("/exports/").pop(); }
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.id}</td><td>${r.job_id}</td><td>${r.kind}</td>
+      <td>${rel? `<a target="_blank" href="${rel}">${rel.split('/').pop()}</a>`:''}</td>
+      <td>${r.size||''}</td><td>${(r.created_at||'').slice(0,19)}</td>`;
+    rb.appendChild(tr);
+  }
+  // images
+  await loadImages();
+}
+
+// ----- queue / worker -----
+async function queue(kind){
+  const date = getDate();
+  await fetch(`${API}/api/export/${kind}`, {method:'POST', headers: hdrs(), body: JSON.stringify({date})});
+  toast(`Queued ${kind.toUpperCase()} for ${date}`);
+  refresh();
+}
+async function queueAll(){
+  const date = getDate();
+  const r = await fetch(`${API}/api/queue/all`, {method:'POST', headers: hdrs(), body: JSON.stringify({date})});
+  const j = await r.json().catch(()=>({}));
+  toast(`Queued all (${(j.queued||[]).length||''})`);
+  refresh();
+}
+async function tick(){
+  const r = await fetch(`${API}/api/worker/tick`, {method:'POST', headers: hdrs()});
+  const ok = (await r.json()).ok;
+  toast(ok ? 'Worker tick ok' : 'Worker tick error', ok);
+  refresh();
+}
+async function retryFailed(){
+  const r = await fetch(`${API}/api/retry_failed`, {method:'POST', headers: hdrs()}).catch(()=>null);
+  toast(r && r.ok ? 'Retrying failed jobs' : 'Retry failed');
+  refresh();
+}
+async function drain(){
+  const r = await fetch(`${API}/api/worker/drain`, {method:'POST', headers: hdrs()});
+  const d = await r.json();
+  toast(`Drained: ${d.iterations||0} ticks, remaining ${d.remaining||0}`);
+  refresh();
+}
+async function sample(){
+  const date = getDate();
+  const r = await fetch(`${API}/api/sample?date=${encodeURIComponent(date)}`, {method:'POST', headers: hdrs()});
+  const j = await r.json().catch(()=>({}));
+  toast(j.ok ? 'Sample created + all exports queued' : 'Sample failed', !!j.ok);
+  refresh();
+}
+
+// ----- gallery & selection -----
+let images = [];
+let sel = [];   // array of absolute file paths
+
+function selectAll(){
+  sel = images.map(x=>x.path);
+  renderSel();
+  renderGallery();
+}
+function clearSel(){
+  sel = [];
+  renderSel();
+  renderGallery();
+}
+function toggle(path){
+  const i = sel.indexOf(path);
+  if(i>=0) sel.splice(i,1); else sel.push(path);
+  renderSel();
+  renderGallery();
+}
+
+async function loadImages(){
+  const date = getDate();
+  const j = await (await fetch(`${API}/api/images?date=${date}`, {headers: hdrs()})).json();
+  images = Array.isArray(j) ? j : (j.value || []);
+  renderGallery();
+  renderSel();
+}
+
+function renderGallery(){
+  const g = document.getElementById('gallery'); g.innerHTML = '';
+  for(const it of images){
+    const d = document.createElement('div');
+    d.className = 'tile' + (sel.includes(it.path)?' selected':'');
+    d.onclick = ()=>toggle(it.path);
+    d.innerHTML = `<div class="pick">pick</div><img loading="lazy" src="${it.web}"/>`;
+    g.appendChild(d);
+  }
+}
+
+function renderSel(){
+  const s = document.getElementById('selection'); s.innerHTML = '';
+  sel.forEach((p,i)=>{
+    const it = images.find(x=>x.path===p);
+    const img = it ? it.web : '';
+    const d = document.createElement('div');
+    d.className = 'sel';
+    d.innerHTML = `<div class="idx">${i+1}</div>${img? `<img src="${img}"/>`:''}`;
+    d.onclick = ()=>{ showCaptionFor(p); };
+    s.appendChild(d);
+  });
+  if(sel.length){ showCaptionFor(sel[0]); } else { showCaptionFor(null); }
+}
+
+// ----- export selected -----
+function exportSel(kind){
+  if(!sel.length){ toast('Pick some images first', false); return; }
+  const date = getDate();
+  const args = {};
+  if(kind==='mp4'){ args.fps = parseFloat(document.getElementById('mp4fps').value||'1.0'); }
+  if(kind==='gif'){ args.ms_per_frame = parseInt(document.getElementById('gifms').value||'100'); }
+  fetch(`${API}/api/export_selected/${kind}`, {
+    method:'POST', headers: hdrs(),
+    body: JSON.stringify({date, files: sel, args})
+  }).then(r=>r.json()).then(j=>{
+    toast(`Queued ${kind.toUpperCase()} for ${sel.length} image(s)`);
+    refresh();
+  }).catch(()=>toast('Export error', false));
+}
+
+// ----- captions -----
+let currentPath = null;
+function showCaptionFor(path){
+  currentPath = path;
+  const name = path ? (path.split(/[/\\\\]/).pop()) : '(none)';
+  document.getElementById('selName').textContent = name;
+  const img = document.getElementById('prevImg');
+  if(!path){ img.src=''; return; }
+  const it = images.find(x=>x.path===path);
+  if(it && it.web) img.src = it.web;
+}
+function useSuggestion(){
+  const box = document.getElementById('capText');
+  if(!box.value.trim()) box.value = "A striking image generated in AISatyagrah.";
+}
+async function saveCaption(){
+  if(!currentPath){ toast('Pick an image first', false); return; }
+  const date = getDate();
+  const body = {
+    date, path: currentPath,
+    caption: document.getElementById('capText').value || "",
+    tags: (document.getElementById('tagInput').value||"").trim()
+  };
+  try{
+    const r = await fetch(`${API}/api/caption`, {method:'POST', headers: hdrs(), body: JSON.stringify(body)});
+    if(r.ok){ document.getElementById('capStatus').textContent = "Saved."; toast('Caption saved'); }
+    else { throw new Error(); }
+  }catch(e){ toast('Save failed', false); }
+}
+function clearCaption(){
+  document.getElementById('capText').value = "";
+  document.getElementById('capStatus').textContent = "";
+}
+
+// ----- init -----
+function init(){
+  authNote();
+  const di = document.getElementById('date'); if(!di.value) di.value = todayStr();
+  refresh();
+}
+init();
+</script>
+</body>
+</html>"""
+
+# ----------------------------- API ---------------------------------
+
+@app.get("/api/jobs")
+def api_jobs(request: Request, limit: int = 30, status: Optional[str] = None, date: Optional[str] = None):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    return list_jobs(DB_PATH, limit=limit, status=status, date=date)
+
+@app.get("/api/results")
+def api_results(request: Request, limit: int = 100, date: Optional[str] = None, job_id: Optional[int] = None):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    return list_results(DB_PATH, limit=limit, date=date, job_id=job_id)
+
+@app.post("/api/export/{kind}")
+def api_export(kind: str, body: ExportReq, request: Request):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    date = body.date or _today()
+    jid = enqueue_export_job(DB_PATH, kind=kind, date=date, payload=(body.args or {}))
+    return {"queued": jid, "kind": kind, "date": date}
+
+@app.post("/api/export_selected/{kind}")
+def api_export_selected(kind: str, body: ExportSelectedReq, request: Request):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    date = body.date or _today()
+    payload = {"files": body.files, "args": body.args or {}}
+    jid = enqueue_export_job(DB_PATH, kind=kind, date=date, payload=payload)
+    return {"queued": jid, "kind": kind, "date": date, "count": len(body.files)}
+
+@app.post("/api/worker/tick")
+def api_worker_tick(request: Request):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    code = run_worker_once(DB_PATH, EXPORTS)
+    return {"ok": (code == 0)}
+
+@app.post("/api/worker/drain")
+def api_worker_drain(request: Request, max_loops: int = 50):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    iters = 0
+    while iters < max_loops:
+        q = list_jobs(DB_PATH, limit=1, status="queued")
+        r = list_jobs(DB_PATH, limit=1, status="running")
+        if not q and not r:
+            break
+        run_worker_once(DB_PATH, EXPORTS)
+        iters += 1
+    remaining = len(list_jobs(DB_PATH, limit=1000, status="queued"))
+    return {"ok": True, "iterations": iters, "remaining": remaining}
+
+@app.post("/api/queue/all")
+def api_queue_all(body: ExportReq, request: Request):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    date = body.date or _today()
+    kinds = ("pdf", "csv", "pptx", "gif", "mp4", "zip")
+    queued = []
+    for k in kinds:
+        queued.append(enqueue_export_job(DB_PATH, kind=k, date=date, payload=(body.args or {})))
+    return {"ok": True, "date": date, "queued": queued}
+
+@app.post("/api/retry_failed")
+def api_retry_failed(request: Request, date: Optional[str] = None):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    date = date or _today()
+    failed = list_jobs(DB_PATH, limit=500, status="failed", date=date)
+    new_ids: List[int] = []
+    for row in failed:
+        kind = (row.get("kind") or "").replace("export:", "")
+        if not kind:
+            continue
+        new_ids.append(enqueue_export_job(DB_PATH, kind=kind, date=row.get("date") or date, payload={}))
+    return {"ok": True, "requeued": new_ids, "count": len(new_ids)}
+
+@app.get("/api/images")
+def api_images(request: Request, date: Optional[str] = None):
+    _require_auth(request)
+    date = date or _today()
+    artdir = ROOT / "data" / "runs" / date / "art"
+    out: List[Dict[str, Any]] = []
+    if artdir.exists():
+        for p in sorted(artdir.glob("*")):
+            if p.suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+                continue
+            try:
+                st = p.stat()
+                rel = p.relative_to(DATA_MOUNT_ROOT).as_posix()
+                out.append({
+                    "name": p.name,
+                    "path": str(p),
+                    "web": "/data/" + rel,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                })
+            except Exception:
+                continue
+    return out
+
+@app.post("/api/caption")
+def api_caption(body: CaptionReq, request: Request):
+    _require_auth(request)
+    date = body.date or _today()
+    rundir = ROOT / "data" / "runs" / date
+    rundir.mkdir(parents=True, exist_ok=True)
+    cap_path = rundir / "captions.json"
+
+    caps: Dict[str, Any] = {}
+    if cap_path.exists():
+        try:
+            caps = json.loads(cap_path.read_text(encoding="utf-8"))
+        except Exception:
+            caps = {}
+
+    caps[body.path] = {"caption": body.caption or "", "tags": body.tags or ""}
+
+    cap_path.write_text(json.dumps(caps, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "saved": body.path}
+
+# ---------- convenience: sample + queue all ----------
+@app.post("/api/sample")
+def api_sample(request: Request, date: Optional[str] = None):
+    _require_auth(request)
+    ensure_db(DB_PATH)
+    date = date or _today()
+
+    artdir = ROOT / "data" / "runs" / date / "art"
+    artdir.mkdir(parents=True, exist_ok=True)
+
+    png_path = artdir / "sample.png"
+    jpg_path = artdir / "sample.jpg"
+
+    try:
+        from PIL import Image, ImageDraw  # type: ignore
+
+        W, H = 1280, 720
+        im = Image.new("RGB", (W, H), (16, 16, 16))
+        d = ImageDraw.Draw(im)
+
+        # vivid background bars
+        bars = [
+            (255, 59, 48), (255, 149, 0), (255, 204, 0), (76, 217, 100),
+            (90, 200, 250), (0, 122, 255), (88, 86, 214), (255, 45, 85)
+        ]
+        bw = W // len(bars)
+        for i, c in enumerate(bars):
+            d.rectangle([i * bw, 0, (i + 1) * bw, H], fill=c)
+
+        # center dark box for text
+        cx, cy = W // 2, H // 2
+        box = [cx - 420, cy - 120, cx + 420, cy + 120]
+        d.rectangle(box, fill=(20, 20, 20))
+
+        # big title + date (Pillow default font is fine; large strokes to pop)
+        title = "AISatyagrah SAMPLE"
+        sub   = f"{date}"
+        d.text((box[0] + 40, box[1] + 40), title, fill=(240, 240, 240))
+        d.text((box[0] + 40, box[1] + 100), sub,   fill=(200, 200, 200))
+
+        # save PNG and JPG so the gallery clearly shows something
+        im.save(png_path, "PNG")
+        im.save(jpg_path, "JPEG", quality=92, optimize=True)
+    except Exception:
+        # last resort: ensure files exist
+        png_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        jpg_path.write_bytes(b"\xff\xd8\xff\xd9")
+
+    # queue all exporters, same as before
+    kinds = ("pdf", "csv", "pptx", "gif", "mp4", "zip")
+    queued = [enqueue_export_job(DB_PATH, kind=k, date=date, payload={}) for k in kinds]
+    return {
+        "ok": True,
+        "date": date,
+        "images": [str(png_path), str(jpg_path)],
+        "queued": queued
+    }

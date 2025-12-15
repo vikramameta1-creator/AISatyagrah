@@ -1,0 +1,71 @@
+{
+  "date": "2025-10-12",
+  "items": [
+    {
+      "kind": "zip",
+      "name": "export_2025-10-12_220529.zip",
+      "path": "exports/2025-10-12/export_2025-10-12_220529.zip",
+      "url": "http://127.0.0.1:9000/exports/2025-10-12/export_2025-10-12_220529.zip",
+      "size": 58211,
+      "size_h": "57 KB",
+      "sha256": "b98701c2d32bcf133f2ad710c99b02add919cac52cd3cdd808867c9823df2b83",
+      "content_type": "application/zip",
+      "created_at": "2025-10-12T09:05:30.381058Z"
+    },
+    {
+      "kind": "csv",
+      "name": "export_2025-10-12_220529.csv",
+      "path": "exports/2025-10-12/export_2025-10-12_220529.csv",
+      "url": "http://127.0.0.1:9000/exports/2025-10-12/export_2025-10-12_220529.csv",
+      "size": 141,
+      "size_h": "141 B",
+      "sha256": "b22f4e8dae46738a305030a4541e62e35d1fc725eafecb934ef8114d8f826018",
+      "content_type": "text/csv",
+      "created_at": "2025-10-12T09:05:30.381058Z"
+    },
+    {
+      "kind": "pdf",
+      "name": "export_2025-10-12_220529.pdf",
+      "path": "exports/2025-10-12/export_2025-10-12_220529.pdf",
+      "url": "http://127.0.0.1:9000/exports/2025-10-12/export_2025-10-12_220529.pdf",
+      "size": 2161,
+      "size_h": "2 KB",
+      "sha256": "63da64b05ec7a4c3875ec5056716c8172c0a8b0074ececec8b10fe23921b087a",
+      "content_type": "application/pdf",
+      "created_at": "2025-10-12T09:05:30.381058Z"
+    },
+    {
+      "kind": "pptx",
+      "name": "export_2025-10-12_220529.pptx",
+      "path": "exports/2025-10-12/export_2025-10-12_220529.pptx",
+      "url": "http://127.0.0.1:9000/exports/2025-10-12/export_2025-10-12_220529.pptx",
+      "size": 90254,
+      "size_h": "88 KB",
+      "sha256": "eb752137957cdefc2e8dcdf4d3c251f5cc2aac61f320d802c21fe1dca7705c76",
+      "content_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "created_at": "2025-10-12T09:05:30.381058Z"
+    },
+    {
+      "kind": "gif",
+      "name": "export_2025-10-12_220530.gif",
+      "path": "exports/2025-10-12/export_2025-10-12_220530.gif",
+      "url": "http://127.0.0.1:9000/exports/2025-10-12/export_2025-10-12_220530.gif",
+      "size": 41222,
+      "size_h": "40 KB",
+      "sha256": "dffdccfc27b895d107a052d31dfe83666dc5517d2034cc2e3bad3cd498783a42",
+      "content_type": "image/gif",
+      "created_at": "2025-10-12T09:05:30.381058Z"
+    },
+    {
+      "kind": "mp4",
+      "name": "export_2025-10-12_220530.mp4",
+      "path": "exports/2025-10-12/export_2025-10-12_220530.mp4",
+      "url": "http://127.0.0.1:9000/exports/2025-10-12/export_2025-10-12_220530.mp4",
+      "size": 15180,
+      "size_h": "15 KB",
+      "sha256": "5fbde97806b8fc75ab0681d5402d807a345d553b1851084d3847f9d6d1198784",
+      "content_type": "video/mp4",
+      "created_at": "2025-10-12T09:05:30.381058Z"
+    }
+  ]
+}

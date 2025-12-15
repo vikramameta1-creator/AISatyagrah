@@ -1,0 +1,774 @@
+﻿from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import string
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone, date as dt_date
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, List
+
+from fastapi import FastAPI, Request, HTTPException
+
+PUBLIC_PATHS = {"/", "/api/health", "/api/version", "/metrics", "/ui/exporter", "/ui/exporter.html"}
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+# ----------------------------
+# Globals / Version / Helpers
+# ----------------------------
+VERSION = "0.0.9"
+
+def now_ts() -> float:
+    return time.time()
+
+def iso_date(d: Optional[str]) -> Optional[str]:
+    if not d:
+        return None
+    try:
+        # YYYY-MM-DD
+        dt = datetime.strptime(d, "%Y-%m-%d").date()
+        return dt.isoformat()
+    except Exception:
+        return None
+
+def _project_root() -> Path:
+    # resolve to repo root if running inside package; fallback to cwd
+    here = Path(__file__).resolve()
+    for p in [here, *here.parents]:
+        if (p / "exports").exists() or (p / "satyagrah").exists():
+            return p
+    return Path.cwd()
+
+ROOT = _project_root()
+
+# ----------------------------
+# Optional dependencies
+# ----------------------------
+try:
+    import jwt as _pyjwt  # PyJWT
+except Exception:
+    _pyjwt = None
+
+try:
+    import redis as _redis
+except Exception:
+    _redis = None
+
+try:
+    from rq import Queue, cancel_job as rq_cancel_job
+except Exception:
+    Queue = None
+    rq_cancel_job = None
+
+# ReportLab (PDF)
+try:
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.pdfgen import canvas as _pdfcanvas
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
+    _pdfcanvas = None
+    LETTER = None
+
+# python-pptx
+try:
+    from pptx import Presentation as _PPT
+    from pptx.util import Inches
+    PPTX_OK = True
+except Exception:
+    PPTX_OK = False
+    _PPT = None
+    Inches = None
+
+# Pillow (GIF)
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
+# ----------------------------
+# Metrics (in-memory counters)
+# ----------------------------
+METRICS = {
+    "exports_started_total": 0,
+    "exports_succeeded_total": 0,
+    "exports_failed_total": 0,
+    "export_duration_seconds_sum": 0.0,
+    "export_duration_seconds_count": 0,
+}
+
+def _inc_metric(key: str, amt: float = 1.0) -> None:
+    METRICS[key] = METRICS.get(key, 0) + amt
+
+# ----------------------------
+# Auth helpers
+# ----------------------------
+def _auth_config() -> Dict[str, Any]:
+    auth_token = os.getenv("AUTH_TOKEN", "")
+    jwt_secret = os.getenv("JWT_SECRET", "")
+    return {
+        "auth_enabled": True if auth_token or jwt_secret else True,  # keep on, we accept either style
+        "jwt_enabled": True if (jwt_secret and _pyjwt) else False,
+        "auth_token": auth_token,
+        "jwt_secret": jwt_secret,
+    }
+
+def _require_auth(req: Request) -> None:
+    cfg = _auth_config()
+    # Prefer JWT if present
+    authz = req.headers.get("Authorization", "")
+    if authz.startswith("Bearer ") and cfg["jwt_enabled"]:
+        token = authz.split(" ", 1)[1].strip()
+        try:
+            _pyjwt.decode(token, cfg["jwt_secret"], algorithms=["HS256"])
+            return
+        except Exception:
+            raise HTTPException(401, detail="unauthorized")
+    # Fallback x-auth
+    xauth = req.headers.get("x-auth", "")
+    if cfg["auth_token"] and xauth == cfg["auth_token"]:
+        return
+    # If neither present/valid:
+    raise HTTPException(401, detail="unauthorized")
+
+# ----------------------------
+# Jobs store (history) fallback
+# ----------------------------
+def _open_jobs_store(root: Path):
+    """
+    Try to use persistent SQLite jobs_store; otherwise use in-memory list.
+    """
+    try:
+        from satyagrah.web.jobs_store import open_jobs_store  # type: ignore
+        return open_jobs_store(str(root))
+    except Exception:
+        # minimal in-memory fallback
+        class _MemStore:
+            def __init__(self):
+                self.items: List[Dict[str, Any]] = []
+                self.lock = threading.Lock()
+            def add(self, item: Dict[str, Any]) -> None:
+                with self.lock:
+                    self.items.append(item)
+            def list(self, limit: int = 20, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+                with self.lock:
+                    total = len(self.items)
+                    return self.items[offset: offset + limit], total
+        return _MemStore()
+
+# ----------------------------
+# Export implementation
+# ----------------------------
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _exports_dir(root: Path, d: Optional[str]) -> Path:
+    if not d:
+        d = datetime.now(timezone.utc).date().isoformat()
+    path = root / "exports" / d
+    _ensure_dir(path)
+    return path
+
+def _rand_text(n=8) -> str:
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+def _write_csv(dst: Path) -> None:
+    rows = [
+        ["id", "title", "status"],
+        ["1", "Alpha", "open"],
+        ["2", "Beta", "closed"],
+    ]
+    with dst.open("w", encoding="utf-8", newline="") as f:
+        for r in rows:
+            f.write(",".join(r) + "\n")
+
+def _write_pdf(dst: Path, msg: str) -> None:
+    if not REPORTLAB_OK:
+        dst.write_text("ReportLab missing; pip install reportlab", encoding="utf-8")
+        return
+    c = _pdfcanvas.Canvas(str(dst), pagesize=LETTER)
+    w, h = LETTER
+    c.setFont("Helvetica", 14)
+    c.drawString(72, h - 72, msg)
+    c.drawString(72, h - 96, f"Generated at: {datetime.now().isoformat(timespec='seconds')}")
+    c.showPage()
+    c.save()
+
+def _write_pptx(dst: Path, title: str) -> None:
+    if not PPTX_OK:
+        dst.write_text("python-pptx missing; pip install python-pptx", encoding="utf-8")
+        return
+    prs = _PPT()
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = title
+    prs.save(str(dst))
+
+def _write_gif(dst: Path, txt: str) -> None:
+    if not PIL_OK:
+        dst.write_text("Pillow missing; pip install pillow", encoding="utf-8")
+        return
+    img = Image.new("RGB", (400, 200), "white")
+    d = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    d.text((10, 90), txt, fill="black", font=font)
+    frames = [img] * 5
+    frames[0].save(str(dst), format="GIF", save_all=True, append_images=frames[1:], duration=200, loop=0)
+
+def _have_ffmpeg() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return True
+    except Exception:
+        return False
+
+def _write_mp4(dst: Path, note: str) -> None:
+    if not _have_ffmpeg():
+        dst.with_suffix(".txt").write_text(
+            "ffmpeg not found in PATH; MP4 not produced.\n", encoding="utf-8"
+        )
+        return
+    # generate a tiny silent black video (1s) 320x240
+    cmd = [
+        "ffmpeg", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1",
+        "-pix_fmt", "yuv420p", str(dst)
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        dst.with_suffix(".txt").write_text(f"ffmpeg failed: {e}\n", encoding="utf-8")
+
+def _zip_outputs(dst_zip: Path, files: List[Path]) -> None:
+    import zipfile
+    with zipfile.ZipFile(str(dst_zip), "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            z.write(str(f), arcname=f.name)
+
+def perform_export(kind: str, date_str: Optional[str], root: Path) -> Dict[str, str]:
+    d = iso_date(date_str) or datetime.now(timezone.utc).date().isoformat()
+    outdir = _exports_dir(root, d)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    base = outdir / f"export_{d}_{stamp}"
+
+    csv_path  = base.with_suffix(".csv")
+    pdf_path  = base.with_suffix(".pdf")
+    pptx_path = base.with_suffix(".pptx")
+    gif_path  = base.with_suffix(".gif")
+    mp4_path  = base.with_suffix(".mp4")
+
+    # Minimal content; can be enriched later
+    _write_csv(csv_path)
+    _write_pdf(pdf_path, f"Export for {d} (kind: {kind})")
+    _write_pptx(pptx_path, f"Export {d}")
+    _write_gif(gif_path, f"Export {d}")
+    _write_mp4(mp4_path, "export video")
+
+    # If 'kind' is a single type, zip all anyway for consistency
+    files = [csv_path, pdf_path, pptx_path, gif_path, mp4_path]
+    zip_path = base.with_suffix(".zip")
+    _zip_outputs(zip_path, files)
+
+    return {
+        "date": d,
+        "csv": str(csv_path),
+        "pdf": str(pdf_path),
+        "pptx": str(pptx_path),
+        "gif": str(gif_path),
+        "mp4": str(mp4_path),
+        "zip": str(zip_path),
+    }
+
+# ----------------------------
+# Memory job runner
+# ----------------------------
+class MemJob:
+    def __init__(self, kind: str, date_str: Optional[str], retries: int, backoff_sec: int, root: Path):
+        self.id = f"mem_{_rand_text(10)}"
+        self.kind = kind
+        self.date = date_str
+        self.retries = max(0, int(retries))
+        self.backoff_sec = max(0, int(backoff_sec))
+        self.created_at = now_ts()
+        self.updated_at = self.created_at
+        self.status = "queued"  # queued|running|done|failed|canceled
+        self.message = ""
+        self.result: Dict[str, Any] = {}
+        self.attempts: List[Dict[str, Any]] = []
+        self.deadline = self.created_at + 3600
+        self.root = root
+        self._cancel = threading.Event()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "id": self.id,
+            "backend": "memory",
+            "kind": self.kind,
+            "date": self.date,
+            "status": self.status,
+            "progress": 100.0 if self.status in ("done", "failed", "canceled") else (50.0 if self.status == "running" else 0.0),
+            "message": self.message,
+            "result": self.result,
+            "attempts": self.attempts,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "deadline": self.deadline,
+        }
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        tries = 0
+        _inc_metric("exports_started_total", 1)
+        while True:
+            if self._cancel.is_set():
+                self.status = "canceled"
+                self.message = "canceled"
+                self.updated_at = now_ts()
+                return
+            self.status = "running"
+            self.message = f"attempt {tries+1}"
+            self.updated_at = now_ts()
+            try:
+                t0 = time.time()
+                res = perform_export(self.kind, self.date, self.root)
+                dur = time.time() - t0
+                _inc_metric("export_duration_seconds_sum", dur)
+                _inc_metric("export_duration_seconds_count", 1)
+                self.result = res
+                self.status = "done"
+                self.message = "complete"
+                self.updated_at = now_ts()
+                _inc_metric("exports_succeeded_total", 1)
+                return
+            except Exception as e:
+                self.attempts.append({"ts": now_ts(), "error": str(e)})
+                tries += 1
+                if tries > self.retries:
+                    self.status = "failed"
+                    self.message = "failed"
+                    self.updated_at = now_ts()
+                    _inc_metric("exports_failed_total", 1)
+                    return
+                time.sleep(self.backoff_sec)
+
+MEM_JOBS: Dict[str, MemJob] = {}
+MEM_LOCK = threading.Lock()
+
+def start_mem_job(kind: str, date_str: Optional[str], retries: int, backoff_sec: int, root: Path) -> str:
+    job = MemJob(kind, date_str, retries, backoff_sec, root)
+    with MEM_LOCK:
+        MEM_JOBS[job.id] = job
+    t = threading.Thread(target=job.run, daemon=True)
+    t.start()
+    return job.id
+
+def get_mem_job(job_id: str) -> Optional[MemJob]:
+    with MEM_LOCK:
+        return MEM_JOBS.get(job_id)
+
+def cancel_mem_job(job_id: str) -> bool:
+    job = get_mem_job(job_id)
+    if not job:
+        return False
+    job.cancel()
+    return True
+
+# ----------------------------
+# Redis / RQ job
+# ----------------------------
+def _rq_available() -> bool:
+    return bool(_redis and Queue and os.getenv("REDIS_URL"))
+
+def rq_connection():
+    if not _redis:
+        raise RuntimeError("redis-py not installed")
+    url = os.getenv("REDIS_URL")
+    if not url:
+        raise RuntimeError("REDIS_URL not set")
+    return _redis.from_url(url)
+
+def rq_queue():
+    if not _rq_available():
+        raise RuntimeError("RQ not available")
+    conn = rq_connection()
+    return Queue("exports", connection=conn)
+
+def rq_job_fetch(job_id: str):
+    if not _rq_available():
+        return None
+    from rq.job import Job
+    conn = rq_connection()
+    try:
+        return Job.fetch(job_id, connection=conn)
+    except Exception:
+        return None
+
+def rq_cancel(job_id: str) -> bool:
+    if not _rq_available():
+        return False
+    try:
+        rq_cancel_job(job_id, connection=rq_connection())
+        return True
+    except Exception:
+        return False
+
+def rq_run_export(kind: str, date_str: Optional[str] = None, root: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Worker function run by RQ (imports this symbol by dotted path).
+    """
+    base_root = Path(root) if root else ROOT
+    res = perform_export(kind, date_str, base_root)
+    return res
+
+# ----------------------------
+# Files listing / cleanup
+# ----------------------------
+def list_files(root: Path, limit: int = 20, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+    exp = root / "exports"
+    if not exp.exists():
+        return [], 0
+    items: List[Tuple[float, Path]] = []
+    for p in exp.rglob("*"):
+        if p.is_file():
+            try:
+                items.append((p.stat().st_mtime, p))
+            except Exception:
+                continue
+    items.sort(key=lambda t: t[0], reverse=True)
+    total = len(items)
+    out: List[Dict[str, Any]] = []
+    for _, p in items[offset: offset + limit]:
+        try:
+            st = p.stat()
+            out.append({"path": str(p), "size": st.st_size, "mtime": st.st_mtime})
+        except Exception:
+            pass
+    return out, total
+
+def cleanup_old(root: Path, older_than_days: int) -> int:
+    exp = root / "exports"
+    if not exp.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for d in exp.iterdir():
+        if d.is_dir():
+            try:
+                # if dir mtime older than threshold, remove
+                mtime = d.stat().st_mtime
+                if now - mtime > older_than_days * 86400:
+                    for p in d.rglob("*"):
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+                    try:
+                        d.rmdir()
+                        removed += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    return removed
+
+# ----------------------------
+# UI exporter HTML
+# ----------------------------
+BUILTIN_EXPORTER_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8"/>
+<title>Exporter</title>
+<style>body{font-family:sans-serif;margin:2rem}code{padding:2px 4px;background:#f3f3f3;border-radius:4px}</style>
+</head>
+<body>
+  <h1>Exporter</h1>
+  <p>Use <code>/api/export/all</code> or <code>/api/jobs</code> with a worker.</p>
+  <button id="run">Export Now</button>
+  <pre id="out"></pre>
+<script>
+document.getElementById('run').onclick = async () => {
+  const r = await fetch('/api/export/all', {method:'POST', headers:{'x-auth': '%(XAUTH)s'}, body:'{}'});
+  document.getElementById('out').textContent = await r.text();
+};
+</script>
+</body>
+</html>
+"""
+
+# ----------------------------
+# FastAPI builders
+# ----------------------------
+def register_routes(app) -> None:
+    """
+    Defensive registrar (no-op unless APIRouter objects exist).
+    This keeps earlier imports from failing.
+    """
+    try:
+        from fastapi import APIRouter  # type: ignore
+
+PUBLIC_PATHS = {"/", "/api/health", "/api/version", "/metrics", "/ui/exporter", "/ui/exporter.html"}
+    except Exception:
+        return
+    for _name, obj in globals().items():
+        try:
+            if isinstance(obj, APIRouter):
+                app.include_router(obj)  # type: ignore[attr-defined]
+        except Exception:
+            continue
+
+def _redis_status() -> Dict[str, Any]:
+    enabled = False
+    if _rq_available():
+        try:
+            conn = rq_connection()
+            conn.ping()
+            enabled = True
+        except Exception:
+            enabled = False
+    return {"ok": True, "enabled": enabled}
+
+def _config_payload() -> Dict[str, Any]:
+    cfg = _auth_config()
+    ui_origins = [
+        "http://127.0.0.1:9000",
+        "http://localhost:9000",
+        "http://127.0.0.1:8010",
+        "http://localhost:8010",
+    ]
+    return {
+        "ok": True,
+        "root": str(ROOT),
+        "auth_enabled": cfg["auth_enabled"],
+        "jwt_enabled": cfg["jwt_enabled"],
+        "ui_origins": ui_origins,
+        "redis_enabled": _redis_status()["enabled"],
+        "redis_url_set": bool(os.getenv("REDIS_URL")),
+        "db_backend": "sqlite",  # if jobs_store.py present, it's SQLite; else mem fallback
+        "debug": bool(os.getenv("DEBUG")),
+    }
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="AISatyagrah Jobs API", version=VERSION)
+    cfg = _config_payload()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cfg["ui_origins"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.state.jobs_store = _open_jobs_store(ROOT)
+    register_routes(app)
+
+    @app.get("/api/health")
+    async def api_health(request: Request):
+        _require_auth(request)
+        return {"ok": True, "ts": now_ts()}
+
+    @app.get("/api/version")
+    async def api_version(request: Request):
+        _require_auth(request)
+        return {"ok": True, "version": VERSION}
+
+    @app.get("/api/config")
+    async def api_config(request: Request):
+        _require_auth(request)
+        return _config_payload()
+
+    @app.get("/api/redis")
+    async def api_redis(request: Request):
+        _require_auth(request)
+        return _redis_status()
+
+    @app.post("/api/export/all")
+    async def api_export_all(request: Request):
+        _require_auth(request)
+        data = {}
+        try:
+            if request.headers.get("content-type", "").startswith("application/json"):
+                data = await request.json()
+        except Exception:
+            data = {}
+        date_str = data.get("date")
+        kind = data.get("kind", "all")
+        res = perform_export(kind, date_str, ROOT)
+        return {"ok": True, **res}
+
+    @app.post("/api/jobs")
+    async def api_jobs_start(request: Request):
+        """
+        Start a job.
+
+        JSON body:
+          {
+            "kind": "all"|"zip"|"pdf"|"pptx"|"csv"|"gif"|"mp4",
+            "date": "YYYY-MM-DD"|null,
+            "use_redis": true|false,
+            "retries": 0..n,
+            "backoff_sec": 0..n
+          }
+        """
+        _require_auth(request)
+        try:
+            data = await request.json()
+            if not isinstance(data, dict):
+                raise ValueError("body must be JSON object")
+        except Exception:
+            raise HTTPException(422, detail="invalid JSON body")
+
+        kind = data.get("kind", "all")
+        date_str = data.get("date")
+        use_redis = bool(data.get("use_redis", False))
+        retries = int(data.get("retries", 0))
+        backoff_sec = int(data.get("backoff_sec", 0))
+
+        if use_redis and _rq_available():
+            q = rq_queue()
+            # IMPORTANT: Provide a resolvable dotted path for RQ workers
+            dotted = "satyagrah.web.jobs_api:rq_run_export"
+            job = q.enqueue(dotted, kwargs={"kind": kind, "date_str": date_str, "root": str(ROOT)})
+            return {"ok": True, "id": job.id, "backend": "redis"}
+        else:
+            jid = start_mem_job(kind, date_str, retries, backoff_sec, ROOT)
+            return {"ok": True, "id": jid, "backend": "memory"}
+
+    @app.get("/api/jobs/{job_id}")
+    async def api_jobs_status(job_id: str, request: Request):
+        _require_auth(request)
+        # Try memory first
+        mj = get_mem_job(job_id)
+        if mj:
+            return mj.to_dict()
+        # Then RQ
+        j = rq_job_fetch(job_id)
+        if j:
+            status = j.get_status(refresh=True)
+            msg = status
+            res = {}
+            try:
+                if j.is_finished:
+                    res = j.result if isinstance(j.result, dict) else {"result": str(j.result)}
+            except Exception:
+                pass
+            prog = 100.0 if j.is_finished else (0.0 if status in ("queued", "deferred") else 50.0)
+            return {
+                "ok": True,
+                "id": j.id,
+                "backend": "redis",
+                "kind": j.meta.get("kind", "all") if hasattr(j, "meta") else "all",
+                "date": j.meta.get("date", None) if hasattr(j, "meta") else None,
+                "status": "done" if j.is_finished else ("failed" if j.is_failed else status),
+                "progress": prog,
+                "message": msg,
+                "result": res,
+                "created_at": j.enqueued_at.timestamp() if j.enqueued_at else None,
+                "updated_at": now_ts(),
+            }
+        raise HTTPException(404, detail="not_found")
+
+    @app.delete("/api/jobs/{job_id}")
+    async def api_jobs_cancel(job_id: str, request: Request):
+        _require_auth(request)
+        mj = get_mem_job(job_id)
+        if mj:
+            cancel_mem_job(job_id)
+            return {"ok": True, "canceled": True, "backend": "memory"}
+        if rq_cancel(job_id):
+            return {"ok": True, "canceled": True, "backend": "redis"}
+        raise HTTPException(404, detail="not_found")
+
+    @app.get("/api/history")
+    async def api_history(limit: int = 20, offset: int = 0, request: Request = None):
+        _require_auth(request)
+        # Prefer persistent store (when available), else reflect current memory jobs
+        store = getattr(app.state, "jobs_store", None)
+        if store and hasattr(store, "list"):
+            try:
+                items, total = store.list(limit=limit, offset=offset)
+                return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+            except Exception:
+                pass
+        # fallback – derive from memory
+        with MEM_LOCK:
+            items = [j.to_dict() for j in MEM_JOBS.values()]
+        total = len(items)
+        items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        return {"ok": True, "items": items[offset: offset + limit], "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/api/files")
+    async def api_files(limit: int = 20, offset: int = 0, request: Request = None):
+        _require_auth(request)
+        items, total = list_files(ROOT, limit=limit, offset=offset)
+        return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+    @app.post("/api/files/cleanup")
+    async def api_files_cleanup(older_than_days: int = 60, request: Request = None):
+        _require_auth(request)
+        removed = cleanup_old(ROOT, older_than_days)
+        return {"ok": True, "removed_dirs": removed, "older_than_days": older_than_days}
+
+    @app.get("/metrics")
+    async def api_metrics() -> PlainTextResponse:
+        parts = []
+        parts.append("# HELP exports_started_total Number of exports started")
+        parts.append("# TYPE exports_started_total counter")
+        parts.append(f"exports_started_total {METRICS['exports_started_total']}")
+        parts.append("# HELP exports_succeeded_total Number of exports succeeded")
+        parts.append("# TYPE exports_succeeded_total counter")
+        parts.append(f"exports_succeeded_total {METRICS['exports_succeeded_total']}")
+        parts.append("# HELP exports_failed_total Number of exports failed")
+        parts.append("# TYPE exports_failed_total counter")
+        parts.append(f"exports_failed_total {METRICS['exports_failed_total']}")
+        parts.append("# HELP export_duration_seconds_sum Sum of durations")
+        parts.append("# TYPE export_duration_seconds_sum counter")
+        parts.append(f"export_duration_seconds_sum {METRICS['export_duration_seconds_sum']:.6f}")
+        parts.append("# HELP export_duration_seconds_count Count of durations")
+        parts.append("# TYPE export_duration_seconds_count counter")
+        parts.append(f"export_duration_seconds_count {METRICS['export_duration_seconds_count']}")
+        # queue lengths
+        mem_q_len = len([j for j in MEM_JOBS.values() if j.status in ("queued", "running")])
+        parts.append("# HELP export_queue_length jobs pending in queue (redis+memory)")
+        parts.append("# TYPE export_queue_length gauge")
+        # redis length
+        redis_q_len = 0
+        if _rq_available():
+            try:
+                redis_q_len = rq_queue().count
+            except Exception:
+                redis_q_len = 0
+        parts.append(f"export_queue_length{{backend='redis'}} {redis_q_len}")
+        parts.append(f"export_queue_length{{backend='memory'}} {mem_q_len}")
+        return PlainTextResponse("\n".join(parts) + "\n", media_type="text/plain; version=0.0.4")
+
+    @app.get("/ui/exporter")
+    async def ui_exporter(request: Request):
+        # optional auth for UI as well
+        _require_auth(request)
+        disk_html = ROOT / "ui" / "exporter.html"
+        if disk_html.exists():
+            return FileResponse(str(disk_html), media_type="text/html")
+        # fallback built-in
+        xauth = os.getenv("AUTH_TOKEN", "")
+        html = BUILTIN_EXPORTER_HTML % {"XAUTH": xauth.replace('"', '\\"')}
+        return HTMLResponse(html)
+
+    return app
+
+# Allow "uvicorn satyagrah.web.jobs_api:create_app --factory ..."
+app = create_app()
+

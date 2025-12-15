@@ -1,0 +1,495 @@
+﻿# satyagrah/web/jobs_api.py
+from __future__ import annotations
+
+import os
+import io
+import csv
+import json
+import time
+import uuid
+import math
+import shutil
+import zipfile
+from pathlib import Path
+from typing import Dict, Any, Optional, AsyncGenerator, List
+
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import (
+    HTMLResponse,
+    PlainTextResponse,
+    FileResponse,
+    JSONResponse,
+    StreamingResponse,
+)
+from fastapi.middleware.cors import CORSMiddleware
+
+# ---------------- Public (no auth) paths ----------------
+PUBLIC_PATHS = {
+    "/",
+    "/api/health",
+    "/api/version",
+    "/metrics",
+    "/ui/exporter",
+    "/ui/exporter.html",
+}
+
+# ---------------- Optional deps (safe) ----------------
+try:
+    from reportlab.pdfgen import canvas  # type: ignore
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
+
+try:
+    from pptx import Presentation  # type: ignore
+    PPTX_OK = True
+except Exception:
+    PPTX_OK = False
+
+try:
+    from PIL import Image  # type: ignore
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
+
+
+def _has_ffmpeg() -> bool:
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        if (Path(p) / "ffmpeg").exists() or (Path(p) / "ffmpeg.exe").exists():
+            return True
+    return False
+
+
+FFMPEG_OK = _has_ffmpeg()
+
+# ---------------- Paths & settings ----------------
+HERE = Path(__file__).resolve()
+ROOT = HERE.parents[2] if len(HERE.parents) > 2 else Path.cwd()  # D:\AISatyagrah
+APP_ROOT = ROOT / "satyagrah"
+EXPORTS = APP_ROOT / "exports"
+UI_DIR = ROOT / "ui"
+EXPORTS.mkdir(parents=True, exist_ok=True)
+UI_DIR.mkdir(parents=True, exist_ok=True)
+
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
+
+# ---------------- Tiny metrics ----------------
+METRICS = {
+    "exports_started_total": 0,
+    "exports_succeeded_total": 0,
+    "exports_failed_total": 0,
+    "export_duration_seconds_sum": 0.0,
+    "export_duration_seconds_count": 0,
+    "queue_len_memory": 0,
+    "queue_len_redis": 0,
+}
+
+# ---------------- In-memory job store ----------------
+class MemJob:
+    def __init__(self, kind: str = "all") -> None:
+        self.id = str(uuid.uuid4())
+        self.kind = kind
+        self.status = "queued"
+        self.created_at = time.time()
+        self.updated_at = self.created_at
+        self.progress = 0.0
+        self.result: Dict[str, Any] = {}
+        self._events: List[str] = []
+
+    def push(self, msg: Dict[str, Any]) -> None:
+        self._events.append(f"data: {json.dumps(msg)}\n\n")
+
+    def event_stream(self) -> AsyncGenerator[bytes, None]:
+        async def _gen():
+            idx = 0
+            # send buffered then short poll
+            while True:
+                while idx < len(self._events):
+                    yield self._events[idx].encode("utf-8")
+                    idx += 1
+                if self.status in ("done", "failed", "canceled"):
+                    break
+                await asyncio.sleep(0.25)  # type: ignore
+        import asyncio  # local import to avoid top-level asyncio dependence
+        return _gen()  # type: ignore
+
+
+MEM_JOBS: Dict[str, MemJob] = {}
+
+# ---------------- Auth helpers ----------------
+def _jwt_ok(req: Request) -> bool:
+    if not JWT_SECRET:
+        return False
+    try:
+        import jwt  # type: ignore
+
+        auth = req.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        token = auth.split(" ", 1)[1].strip()
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return True
+    except Exception:
+        return False
+
+
+async def _enforce_auth(request: Request) -> None:
+    if request.url.path in PUBLIC_PATHS:
+        return
+    # x-auth
+    if AUTH_TOKEN and request.headers.get("x-auth", "") == AUTH_TOKEN:
+        return
+    # JWT (optional)
+    if _jwt_ok(request):
+        return
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
+# ---------------- App factory ----------------
+def create_app() -> FastAPI:
+    app = FastAPI(title="AISatyagrah Jobs API")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://127.0.0.1:8010",
+            "http://localhost:8010",
+        ],
+        allow_headers=["*"],
+        allow_methods=["*"],
+    )
+
+    @app.middleware("http")
+    async def auth_mw(request: Request, call_next):
+        try:
+            await _enforce_auth(request)
+        except HTTPException as e:
+            return JSONResponse({"detail": e.detail}, status_code=e.status_code)
+        return await call_next(request)
+
+    register_routes(app)
+    return app
+
+
+# ---------------- Routes ----------------
+def _html_index() -> str:
+    return """<h1>AISatyagrah Jobs API</h1>
+<ul>
+<li>GET <code>/api/version</code></li>
+<li>GET <code>/api/health</code></li>
+<li>GET <code>/api/config</code></li>
+<li>POST <code>/api/export/all</code> etc.</li>
+<li>POST <code>/api/jobs</code>, GET/DELETE <code>/api/jobs/&lt;id&gt;</code>, SSE <code>/api/jobs/&lt;id&gt;/events</code></li>
+<li>GET <code>/api/files</code>, POST <code>/api/files/cleanup</code></li>
+<li>GET <code>/api/history</code> (memory only in this build)</li>
+<li>GET <code>/metrics</code></li>
+<li>UI: <a href="/ui/exporter">/ui/exporter</a></li>
+</ul>
+"""
+
+def _version() -> str:
+    return "Coding 4"
+
+def export_dir_for_today() -> Path:
+    d = time.strftime("%Y-%m-%d")
+    p = EXPORTS / d
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _write_csv(path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["when", "message"])
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        for i in range(5):
+            w.writerow([now, f"Row {i+1}"])
+
+def _write_pdf(path: Path) -> None:
+    if REPORTLAB_OK:
+        c = canvas.Canvas(str(path))
+        c.setFont("Helvetica", 14)
+        c.drawString(72, 740, "AISatyagrah PDF")
+        c.drawString(72, 720, time.strftime("%Y-%m-%d %H:%M:%S"))
+        c.save()
+    else:
+        path.write_text("ReportLab missing. Install reportlab.", encoding="utf-8")
+
+def _write_pptx(path: Path) -> None:
+    if PPTX_OK:
+        from pptx.util import Inches  # type: ignore
+
+        pres = Presentation()  # type: ignore
+        layout = pres.slide_layouts[5]  # Title Only
+        slide = pres.slides.add_slide(layout)
+        slide.shapes.title.text = "AISatyagrah Export"
+        pres.save(str(path))
+    else:
+        path.write_text("python-pptx missing. Install python-pptx.", encoding="utf-8")
+
+def _write_gif(path: Path) -> None:
+    if PIL_OK:
+        img = Image.new("RGB", (256, 64), (20, 40, 60))
+        img.save(str(path), format="GIF")
+    else:
+        path.write_text("Pillow missing. Install pillow.", encoding="utf-8")
+
+def _write_mp4(path: Path) -> None:
+    if FFMPEG_OK:
+        # make a tiny silent MP4 (1s black frame) using ffmpeg if present
+        tmp = path.with_suffix(".txt")
+        tmp.write_text("ffmpeg ok", encoding="utf-8")
+        # For simplicity in this demo, just leave text proving ffmpeg presence.
+        # You can replace with a real ffmpeg command if needed.
+        path.write_text("ffmpeg present on PATH", encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+    else:
+        path.write_text("ffmpeg missing. Add ffmpeg to PATH.", encoding="utf-8")
+
+def _pack_zip(zip_path: Path, members: List[Path]) -> None:
+    with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as z:
+        for m in members:
+            z.write(m, arcname=m.name)
+
+def _export_all() -> Dict[str, Any]:
+    METRICS["exports_started_total"] += 1
+    t0 = time.time()
+    dd = export_dir_for_today()
+    stamp = time.strftime("%Y-%m-%d_%H%M%S")
+
+    csv_p = dd / f"export_{time.strftime('%Y-%m-%d')}_{stamp}.csv"
+    pdf_p = dd / f"export_{time.strftime('%Y-%m-%d')}_{stamp}.pdf"
+    pptx_p = dd / f"export_{time.strftime('%Y-%m-%d')}_{stamp}.pptx"
+    gif_p = dd / f"export_{time.strftime('%Y-%m-%d')}_{stamp}.gif"
+    mp4_p = dd / f"export_{time.strftime('%Y-%m-%d')}_{stamp}.mp4"
+    zip_p = dd / f"export_{time.strftime('%Y-%m-%d')}_{stamp}.zip"
+
+    try:
+        _write_csv(csv_p)
+        _write_pdf(pdf_p)
+        _write_pptx(pptx_p)
+        _write_gif(gif_p)
+        _write_mp4(mp4_p)
+        _pack_zip(zip_p, [csv_p, pdf_p, pptx_p, gif_p, mp4_p])
+        METRICS["exports_succeeded_total"] += 1
+        ok = True
+    except Exception:
+        METRICS["exports_failed_total"] += 1
+        ok = False
+    dur = time.time() - t0
+    METRICS["export_duration_seconds_sum"] += dur
+    METRICS["export_duration_seconds_count"] += 1
+
+    return {
+        "ok": ok,
+        "date": time.strftime("%Y-%m-%d"),
+        "csv": str(csv_p),
+        "pdf": str(pdf_p),
+        "pptx": str(pptx_p),
+        "gif": str(gif_p),
+        "mp4": str(mp4_p),
+        "zip": str(zip_p),
+    }
+
+def _list_files(limit: int, offset: int) -> Dict[str, Any]:
+    all_files: List[Path] = []
+    if EXPORTS.exists():
+        for p in EXPORTS.rglob("*"):
+            if p.is_file():
+                all_files.append(p)
+    all_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    total = len(all_files)
+    items = []
+    for p in all_files[offset:offset+limit]:
+        st = p.stat()
+        items.append({"path": str(p), "size": st.st_size, "mtime": st.st_mtime})
+    return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+def _cleanup(older_than_days: int) -> Dict[str, Any]:
+    cutoff = time.time() - older_than_days * 86400
+    removed = 0
+    if EXPORTS.exists():
+        for p in EXPORTS.rglob("*"):
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                try:
+                    p.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+    return {"ok": True, "removed": removed, "older_than_days": older_than_days}
+
+def register_routes(app: FastAPI) -> None:
+    @app.get("/", response_class=HTMLResponse)
+    async def index():
+        return _html_index()
+
+    @app.get("/api/health")
+    async def api_health():
+        return {"ok": True, "ts": time.time()}
+
+    @app.get("/api/version")
+    async def api_version():
+        return {"ok": True, "version": _version()}
+
+    @app.get("/api/config")
+    async def api_config():
+        return {
+            "ok": True,
+            "root": str(ROOT),
+            "auth_enabled": bool(AUTH_TOKEN),
+            "jwt_enabled": bool(JWT_SECRET),
+            "ui_origins": [
+                "http://127.0.0.1:9000",
+                "http://localhost:9000",
+                "http://127.0.0.1:8010",
+                "http://localhost:8010",
+            ],
+            "redis_enabled": False,
+            "redis_url_set": False,
+            "db_backend": "memory",
+            "debug": False,
+        }
+
+    # --- simple exporter (in-process) ---
+    @app.post("/api/export/all")
+    async def api_export_all():
+        res = _export_all()
+        return res
+
+    # --- files ---
+    @app.get("/api/files")
+    async def api_files(limit: int = 20, offset: int = 0):
+        return _list_files(max(1, min(200, limit)), max(0, offset))
+
+    @app.post("/api/files/cleanup")
+    async def api_files_cleanup(older_than_days: int = 60):
+        return _cleanup(max(1, older_than_days))
+
+    # --- minimal jobs (memory) ---
+    @app.post("/api/jobs")
+    async def api_jobs_start(body: Dict[str, Any] | None = None):
+        kind = (body or {}).get("kind", "all")
+        job = MemJob(kind=kind)
+        MEM_JOBS[job.id] = job
+        job.status = "running"
+        job.push({"status": "running", "progress": 0})
+        # do work synchronously for demo
+        job.result = _export_all()
+        job.progress = 100.0
+        job.status = "done"
+        job.updated_at = time.time()
+        job.push({"status": "done", "result": job.result})
+        return {"ok": True, "id": job.id, "backend": "memory"}
+
+    @app.get("/api/jobs/{job_id}")
+    async def api_jobs_get(job_id: str):
+        j = MEM_JOBS.get(job_id)
+        if not j:
+            raise HTTPException(404, "not_found")
+        return {
+            "ok": True,
+            "id": j.id,
+            "backend": "memory",
+            "kind": j.kind,
+            "status": j.status,
+            "created_at": j.created_at,
+            "updated_at": j.updated_at,
+            "progress": j.progress,
+            "result": j.result,
+        }
+
+    @app.delete("/api/jobs/{job_id}")
+    async def api_jobs_cancel(job_id: str):
+        j = MEM_JOBS.get(job_id)
+        if not j:
+            raise HTTPException(404, "not_found")
+        j.status = "canceled"
+        j.updated_at = time.time()
+        j.push({"status": "canceled"})
+        return {"ok": True, "id": j.id, "status": j.status}
+
+    @app.get("/api/jobs/{job_id}/events")
+    async def api_jobs_events(job_id: str):
+        j = MEM_JOBS.get(job_id)
+        if not j:
+            async def _not_found():
+                yield b"data: " + json.dumps({"ok": False, "error": "not_found"}).encode("utf-8") + b"\n\n"
+            return StreamingResponse(_not_found(), media_type="text/event-stream")
+        return StreamingResponse(j.event_stream(), media_type="text/event-stream")
+
+    # --- history (memory stub) ---
+    @app.get("/api/history")
+    async def api_history(limit: int = 20, offset: int = 0):
+        # simple view from MEM_JOBS
+        items = list(MEM_JOBS.values())
+        items.sort(key=lambda j: j.created_at, reverse=True)
+        slice_ = items[offset:offset+limit]
+        out = [
+            {
+                "id": j.id,
+                "backend": "memory",
+                "kind": j.kind,
+                "status": j.status,
+                "created_at": j.created_at,
+                "updated_at": j.updated_at,
+            }
+            for j in slice_
+        ]
+        return {"ok": True, "items": out, "total": len(items), "limit": limit, "offset": offset}
+
+    # --- metrics ---
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics():
+        return (
+            "# HELP exports_started_total Number of exports started\n"
+            "# TYPE exports_started_total counter\n"
+            f"exports_started_total {METRICS['exports_started_total']}\n"
+            "# HELP exports_succeeded_total Number of exports succeeded\n"
+            "# TYPE exports_succeeded_total counter\n"
+            f"exports_succeeded_total {METRICS['exports_succeeded_total']}\n"
+            "# HELP exports_failed_total Number of exports failed\n"
+            "# TYPE exports_failed_total counter\n"
+            f"exports_failed_total {METRICS['exports_failed_total']}\n"
+            "# HELP export_duration_seconds_sum Sum of durations\n"
+            "# TYPE export_duration_seconds_sum counter\n"
+            f"export_duration_seconds_sum {METRICS['export_duration_seconds_sum']}\n"
+            "# HELP export_duration_seconds_count Count of durations\n"
+            "# TYPE export_duration_seconds_count counter\n"
+            f"export_duration_seconds_count {METRICS['export_duration_seconds_count']}\n"
+            "# HELP export_queue_length jobs pending in queue (redis+memory)\n"
+            "# TYPE export_queue_length gauge\n"
+            "export_queue_length{backend='redis'} 0\n"
+            f"export_queue_length{backend='memory'} {len(MEM_JOBS)}\n"
+        )
+
+    # --- simple UI (static) ---
+    @app.get("/ui/exporter", response_class=HTMLResponse)
+    async def ui_exporter():
+        f = UI_DIR / "exporter.html"
+        if f.exists():
+            return f.read_text(encoding="utf-8")
+        return """<!doctype html>
+<title>Exporter</title>
+<meta charset="utf-8"/>
+<style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;background:#111;color:#eee}
+input,button{font-size:16px;padding:8px 10px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
+pre{background:#0b0b0b;border:1px solid #333;border-radius:8px;padding:12px;white-space:pre-wrap}
+.row{margin:8px 0}</style>
+<div class=row>Token: <input id=tok placeholder="x-auth token" size=32 value="mysupersecrettoken"></div>
+<div class=row><button onclick="exportAll()">Export All (in-process)</button>
+<button onclick="listFiles()">List Latest Files</button>
+<button onclick="metrics()">Metrics</button></div>
+<pre id=out>{}</pre>
+<script>
+const base=""; // same origin
+function H(){return {"x-auth":document.getElementById('tok').value};}
+function show(o){document.getElementById('out').textContent=JSON.stringify(o,null,2);}
+async function exportAll(){let r=await fetch(base+"/api/export/all",{method:"POST",headers:H()});show(await r.json());}
+async function listFiles(){let r=await fetch(base+"/api/files?limit=5&offset=0",{headers:H()});show(await r.json());}
+async function metrics(){let t=await (await fetch(base+"/metrics")).text();show(t);}
+</script>"""
+
+# allow "uvicorn satyagrah.web.jobs_api:app"
+app = create_app()

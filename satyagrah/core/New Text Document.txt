@@ -1,0 +1,22 @@
+from pathlib import Path
+import os
+from pydantic import BaseModel
+
+class Config(BaseModel):
+    proj: Path
+    outbox: Path
+    inbox: Path | None = None
+    results: Path | None = None
+    default_region: str = "india"
+    sd_host: str = "http://127.0.0.1:7860"
+
+    @staticmethod
+    def from_env(proj: Path) -> "Config":
+        return Config(
+            proj=proj,
+            outbox=Path(os.getenv("SATYAGRAH_PEER_OUTBOX", proj / "jobs/outbox")),
+            inbox=Path(os.getenv("SATYAGRAH_PEER_INBOX")) if os.getenv("SATYAGRAH_PEER_INBOX") else None,
+            results=Path(os.getenv("SATYAGRAH_PEER_RESULTS")) if os.getenv("SATYAGRAH_PEER_RESULTS") else None,
+            default_region=os.getenv("SATYAGRAH_DEFAULT_REGION","india"),
+            sd_host=os.getenv("SATYAGRAH_SD_HOST","http://127.0.0.1:7860"),
+        )
