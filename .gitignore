@@ -1,8 +1,23 @@
-﻿.env
-.venv/
+﻿# Python
 __pycache__/
-exports/
-data/runs/
 *.pyc
-state.db
-logs/
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# Local runs/exports (big + changing)
+data/runs/
+exports/archive/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

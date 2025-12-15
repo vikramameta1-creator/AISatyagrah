@@ -1,567 +1,471 @@
-﻿# satyagrah/web/jobs_api.py
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import os
+import csv
 import json
-import datetime as _dt
+import os
+from datetime import datetime, date
 from pathlib import Path
-from typing import Optional, Any, Dict, List
-from urllib.parse import quote  # <-- added: for safe web paths
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, APIRouter, Request, UploadFile, File, HTTPException, Query, Body
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-
-# ---- internal app imports (already exist in your project) ----
-from ..models.db import ensure_db, list_jobs, list_results
-from ..services.worker import enqueue_export_job, run_worker_once
-
-# ---- paths ----
-ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = ROOT / "state.db"
-EXPORTS = ROOT / "exports"
-EXPORTS.mkdir(parents=True, exist_ok=True)
-
-# We mount the whole repo at /data so UI can link to /data/runs/<date>/art/<img>
-DATA_MOUNT_ROOT = ROOT
-
-# ---- auth (optional) ----
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
 
 
-def _today() -> str:
-    return _dt.date.today().isoformat()
+# ---------------------------------------------------------------------
+# Paths (this file is: <ROOT>\satyagrah\web\jobs_api.py)
+# ---------------------------------------------------------------------
+THIS_FILE = Path(__file__).resolve()
+ROOT_DIR = THIS_FILE.parents[2]
+UI_DIR = ROOT_DIR / "ui"
+RUNS_DIR = ROOT_DIR / "data" / "runs"
+PLAN_NAME = "newsroom_plan.jsonl"
 
 
-def _require_auth(request: Request):
-    if not AUTH_TOKEN:
+# ---------------------------------------------------------------------
+# Auth: if AUTH_TOKEN env var set, require x-auth header (or Bearer)
+# ---------------------------------------------------------------------
+def _required_token() -> str:
+    return (os.getenv("AUTH_TOKEN") or "").strip()
+
+def _get_request_token(req: Request) -> str:
+    # Prefer x-auth header, fallback to Authorization: Bearer <token>
+    tok = (req.headers.get("x-auth") or "").strip()
+    if tok:
+        return tok
+    auth = (req.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return ""
+
+def require_auth(req: Request) -> None:
+    need = _required_token()
+    if not need:
         return
-    if request.headers.get("x-auth", "") != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    got = _get_request_token(req)
+    if not got or got != need:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-auth token")
 
 
-# ---- pydantic models ----
-class ExportReq(BaseModel):
-    date: Optional[str] = None
-    args: Optional[Dict[str, Any]] = None
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def ensure_dirs() -> None:
+    UI_DIR.mkdir(parents=True, exist_ok=True)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
+def norm_date(d: Optional[str]) -> str:
+    if d and str(d).strip():
+        return str(d).strip()
+    return date.today().isoformat()
 
-class ExportSelectedReq(BaseModel):
-    date: Optional[str] = None
-    files: List[str]
-    args: Optional[Dict[str, Any]] = None
+def run_dir(d: str) -> Path:
+    return RUNS_DIR / d
 
+def plan_path(d: str) -> Path:
+    return run_dir(d) / PLAN_NAME
 
-class CaptionReq(BaseModel):
-    date: str
-    path: str
-    caption: Optional[str] = ""
-    tags: Optional[str] = ""
-
-
-# ---- FastAPI app ----
-app = FastAPI(title="AISatyagrah Jobs API")
-
-# Static mounts
-app.mount("/exports", StaticFiles(directory=str(EXPORTS)), name="exports")
-app.mount("/data", StaticFiles(directory=str(DATA_MOUNT_ROOT)), name="data")
-
-
-# ----------------------------- UI ---------------------------------
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    # NOTE: no f-string here (raw triple-quoted string) to avoid brace escaping.
-    # The UI calls the API routes defined below.
-    return """<!doctype html>
-<html lang='en'>
-<meta charset='utf-8'/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>AISatyagrah — Export Queue</title>
-<style>
-:root{color-scheme:dark light}
-*{box-sizing:border-box}
-body{font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;background:#111;color:#eee}
-h1{font-size:22px;margin:0 0 12px}
-h3{margin:18px 0 8px}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-input,button,select{padding:8px 10px;border-radius:10px;border:1px solid #333;background:#1e1e1e;color:#eee}
-input[type=number]{width:80px}
-button{cursor:pointer}
-button.primary{background:#2b6cb0}
-button:disabled{opacity:.6;cursor:not-allowed}
-.small{font-size:12px;opacity:.8}
-table{border-collapse:collapse;width:100%;margin-top:10px}
-th,td{border-bottom:1px solid #2a2a2a;padding:8px;text-align:left;font-variant-numeric:tabular-nums}
-a{color:#7ecbff;text-decoration:none}
-a:hover{text-decoration:underline}
-.badge{display:inline-block;background:#222;border:1px solid #333;border-radius:12px;padding:3px 8px;margin-left:6px;font-size:12px}
-#toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:1000}
-.toast{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:10px;padding:10px 12px;box-shadow:0 4px 12px rgb(0 0 0 / .4)}
-.toast.ok{border-color:#2e7d32}
-.toast.err{border-color:#c62828}
-#gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px}
-.tile{position:relative;border:2px solid #282828;border-radius:12px;overflow:hidden;background:#000;cursor:pointer;min-height:160px}
-.tile img{width:100%;height:100%;object-fit:cover;display:block}
-.tile .pick{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.55);border:1px solid #444;padding:2px 8px;border-radius:20px;font-size:12px}
-.tile.selected{outline:3px solid #3b82f6;border-color:#3b82f6}
-#selection{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
-.sel{width:240px;height:160px;border:2px dashed #333;border-radius:12px;overflow:hidden;background:#000;position:relative}
-.sel img{width:100%;height:100%;object-fit:cover}
-.sel .idx{position:absolute;left:8px;top:8px;background:#000a;border:1px solid #444;padding:1px 6px;border-radius:16px;font-size:12px}
-.grid2{display:grid;grid-template-columns:1.2fr .9fr;gap:16px;margin-top:12px}
-.panel{border:1px solid #2a2a2a;border-radius:12px;padding:10px;background:#151515}
-label.ln{display:block;margin:6px 0 4px}
-textarea{width:100%;min-height:140px;border-radius:10px;border:1px solid #333;background:#1a1a1a;color:#eee;padding:10px}
-.preview{background:#0a0a0a;border-radius:12px;border:1px solid #222;padding:10px}
-.preview img{max-width:100%;display:block;border-radius:10px}
-@media (max-width:1100px){.grid2{grid-template-columns:1fr}}
-</style>
-
-<body>
-<h1>AISatyagrah — Export Queue <span class="small badge" id="authNote"></span></h1>
-
-<div class="row">
-  <label>Date <input id="date" type="date"/></label>
-  <button onclick="queue('pdf')">Queue PDF</button>
-  <button onclick="queue('csv')">Queue CSV</button>
-  <button onclick="queue('pptx')">Queue PPTX</button>
-  <button onclick="queue('gif')">Queue GIF</button>
-  <button onclick="queue('mp4')">Queue MP4</button>
-  <button onclick="queue('zip')">Queue ZIP</button>
-  <button onclick="queueAll()">Queue All</button>
-  <button onclick="tick()">Worker Tick</button>
-  <button onclick="retryFailed()">Retry Failed</button>
-  <button onclick="drain()">Drain Queue</button>
-  <button onclick="setToken()">Set Token</button>
-</div>
-
-<h3>Jobs</h3>
-<table id="jobs">
-  <thead><tr>
-    <th>id</th><th>date</th><th>kind</th><th>status</th>
-    <th>created</th><th>finished</th><th>error</th>
-  </tr></thead>
-  <tbody></tbody>
-</table>
-
-<h3>Results (today)</h3>
-<table id="results">
-  <thead><tr>
-    <th>id</th><th>job_id</th><th>kind</th><th>file</th><th>size</th><th>created</th>
-  </tr></thead>
-  <tbody></tbody>
-</table>
-
-<h3>Gallery (today)</h3>
-<div class="row">
-  <button onclick="selectAll()">Select All</button>
-  <button onclick="clearSel()">Clear</button>
-  <span>| Export selected →</span>
-  <span> MP4 fps <input id="mp4fps" type="number" step="0.1" value="1.8"/></span>
-  <span> GIF ms/frame <input id="gifms" type="number" step="5" value="110"/></span>
-  <button onclick="exportSel('pdf')">PDF</button>
-  <button onclick="exportSel('pptx')">PPTX</button>
-  <button onclick="exportSel('gif')">GIF</button>
-  <button onclick="exportSel('mp4')">MP4</button>
-  <button onclick="exportSel('csv')">CSV</button>
-  <button onclick="exportSel('zip')">ZIP</button>
-</div>
-<div id="gallery"></div>
-
-<h3>Selection (drag to reorder)</h3>
-<div id="selection"></div>
-
-<div class="grid2">
-  <div class="panel">
-    <div class="small ln">Selected image: <b id="selName">(none)</b></div>
-    <label class="ln">Caption</label>
-    <textarea id="capText" placeholder="Write a short caption..."></textarea>
-    <label class="ln">Hashtags</label>
-    <input id="tagInput" value="#tag1 #tag2"/>
-    <div class="row" style="margin-top:10px">
-      <button onclick="useSuggestion()">Use suggestion</button>
-      <button onclick="saveCaption()">Save Caption</button>
-      <button onclick="clearCaption()">Clear for this image</button>
-    </div>
-    <div class="small" id="capStatus"></div>
-  </div>
-  <div class="preview panel">
-    <div class="small ln">Preview</div>
-    <img id="prevImg" alt="preview"/>
-    <div class="small">Saved to: data/runs/&lt;date&gt;/captions.json</div>
-  </div>
-</div>
-
-<div id="toasts"></div>
-
-<script>
-const API = location.origin;
-
-// ----- auth header -----
-function hdrs(){
-  const h = {'Content-Type':'application/json'};
-  const tok = localStorage.getItem('saty_token') || '';
-  if(tok) h['x-auth'] = tok;
-  return h;
-}
-function setToken(){
-  const v = prompt("Set x-auth token (empty to clear):", localStorage.getItem('saty_token') || "");
-  if(v !== null){ localStorage.setItem('saty_token', v.trim()); authNote(); toast("Token updated"); }
-}
-function authNote(){
-  const tok = localStorage.getItem('saty_token') || '';
-  const el = document.getElementById('authNote');
-  el.textContent = tok ? "auth: on" : "auth: off";
-}
-
-// ----- utils -----
-function todayStr(){
-  const d = new Date(), z = d.getTimezoneOffset()*60000;
-  return (new Date(Date.now()-z)).toISOString().slice(0,10);
-}
-function getDate(){ return document.getElementById('date').value || todayStr(); }
-function toast(msg, ok=true){
-  const wrap = document.getElementById('toasts');
-  const div = document.createElement('div');
-  div.className = 'toast ' + (ok ? 'ok':'err');
-  div.textContent = msg;
-  wrap.appendChild(div);
-  setTimeout(()=>div.remove(), 2400);
-}
-
-// ----- jobs/results -----
-async function refresh(){
-  const date = getDate();
-  const jobs = await (await fetch(`${API}/api/jobs?limit=50&date=${date}`, {headers: hdrs()})).json();
-  const jb = document.querySelector('#jobs tbody'); jb.innerHTML = '';
-  for(const r of jobs){
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${r.id}</td><td>${r.date||''}</td><td>${r.kind||''}</td><td>${r.status||''}</td>
-      <td>${(r.created_at||'').slice(0,19)}</td><td>${(r.finished_at||'').slice(0,19)}</td><td>${r.error?'err':''}</td>`;
-    jb.appendChild(tr);
-  }
-  const res = await (await fetch(`${API}/api/results?date=${date}&limit=200`, {headers: hdrs()})).json();
-  const rb = document.querySelector('#results tbody'); rb.innerHTML = '';
-  for(const r of res){
-    let rel = r.path || "";
-    if(rel.includes("\\\\exports\\\\")){ rel = "/exports/" + rel.split("\\\\exports\\\\").pop(); }
-    else if(rel.includes("/exports/")){ rel = "/exports/" + rel.split("/exports/").pop(); }
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${r.id}</td><td>${r.job_id}</td><td>${r.kind}</td>
-      <td>${rel? `<a target="_blank" href="${rel}">${rel.split('/').pop()}</a>`:''}</td>
-      <td>${r.size||''}</td><td>${(r.created_at||'').slice(0,19)}</td>`;
-    rb.appendChild(tr);
-  }
-  await loadImages();
-}
-
-// ----- queue / worker -----
-async function queue(kind){
-  const date = getDate();
-  await fetch(`${API}/api/export/${kind}`, {method:'POST', headers: hdrs(), body: JSON.stringify({date})});
-  toast(`Queued ${kind.toUpperCase()} for ${date}`);
-  refresh();
-}
-async function queueAll(){
-  const date = getDate();
-  const r = await fetch(`${API}/api/queue/all`, {method:'POST', headers: hdrs(), body: JSON.stringify({date})});
-  const j = await r.json().catch(()=>({}));
-  toast(`Queued all (${(j.queued||[]).length||''})`);
-  refresh();
-}
-async function tick(){
-  const r = await fetch(`${API}/api/worker/tick`, {method:'POST', headers: hdrs()});
-  const ok = (await r.json()).ok;
-  toast(ok ? 'Worker tick ok' : 'Worker tick error', ok);
-  refresh();
-}
-async function retryFailed(){
-  const r = await fetch(`${API}/api/retry_failed`, {method:'POST', headers: hdrs()}).catch(()=>null);
-  toast(r && r.ok ? 'Retrying failed jobs' : 'Retry failed');
-  refresh();
-}
-async function drain(){
-  const r = await fetch(`${API}/api/worker/drain`, {method:'POST', headers: hdrs()});
-  const d = await r.json();
-  toast(`Drained: ${d.iterations||0} ticks, remaining ${d.remaining||0}`);
-  refresh();
-}
-
-// ----- gallery & selection -----
-let images = [];
-let sel = [];
-
-function selectAll(){
-  sel = images.map(x=>x.path);
-  renderSel();
-  renderGallery();
-}
-function clearSel(){
-  sel = [];
-  renderSel();
-  renderGallery();
-}
-function toggle(path){
-  const i = sel.indexOf(path);
-  if(i>=0) sel.splice(i,1); else sel.push(path);
-  renderSel();
-  renderGallery();
-}
-
-async function loadImages(){
-  const date = getDate();
-  const j = await (await fetch(`${API}/api/images?date=${date}`, {headers: hdrs()})).json();
-  images = Array.isArray(j) ? j : (j.value || []);
-  renderGallery();
-  renderSel();
-}
-
-function renderGallery(){
-  const g = document.getElementById('gallery'); g.innerHTML = '';
-  for(const it of images){
-    const d = document.createElement('div');
-    d.className = 'tile' + (sel.includes(it.path)?' selected':'');
-    d.onclick = ()=>toggle(it.path);
-    d.innerHTML = `<div class="pick">pick</div><img loading="lazy" src="${it.web}" onerror="this.style.display='none'"/>`;
-    g.appendChild(d);
-  }
-}
-
-function renderSel(){
-  const s = document.getElementById('selection'); s.innerHTML = '';
-  sel.forEach((p,i)=>{
-    const img = (images.find(x=>x.path===p)||{}).web || '';
-    const d = document.createElement('div');
-    d.className = 'sel';
-    d.innerHTML = `<div class="idx">${i+1}</div>${img? `<img src="${img}"/>`:''}`;
-    d.onclick = ()=>{ showCaptionFor(p); };
-    s.appendChild(d);
-  });
-  if(sel.length){ showCaptionFor(sel[0]); } else { showCaptionFor(null); }
-}
-
-function exportSel(kind){
-  if(!sel.length){ toast('Pick some images first', false); return; }
-  const date = getDate();
-  const args = {};
-  if(kind==='mp4'){ args.fps = parseFloat(document.getElementById('mp4fps').value||'1.0'); }
-  if(kind==='gif'){ args.ms_per_frame = parseInt(document.getElementById('gifms').value||'100'); }
-  fetch(`${API}/api/export_selected/${kind}`, {
-    method:'POST', headers: hdrs(),
-    body: JSON.stringify({date, files: sel, args})
-  }).then(r=>r.json()).then(j=>{
-    toast(`Queued ${kind.toUpperCase()} for ${sel.length} image(s)`);
-    refresh();
-  }).catch(()=>toast('Export error', false));
-}
-
-// ----- captions (simple) -----
-let currentPath = null;
-function showCaptionFor(path){
-  currentPath = path;
-  const name = path ? (path.split(/[/\\\\]/).pop()) : '(none)';
-  document.getElementById('selName').textContent = name;
-  const img = document.getElementById('prevImg');
-  if(!path){ img.src=''; return; }
-  const it = images.find(x=>x.path===path);
-  if(it && it.web) img.src = it.web;
-}
-function useSuggestion(){
-  const box = document.getElementById('capText');
-  if(!box.value.trim()) box.value = "A striking image generated in AISatyagrah.";
-}
-async function saveCaption(){
-  if(!currentPath){ toast('Pick an image first', false); return; }
-  const date = getDate();
-  const body = {
-    date, path: currentPath,
-    caption: document.getElementById('capText').value || "",
-    tags: (document.getElementById('tagInput').value||"").trim()
-  };
-  try{
-    const r = await fetch(`${API}/api/caption`, {method:'POST', headers: hdrs(), body: JSON.stringify(body)});
-    if(r.ok){ document.getElementById('capStatus').textContent = "Saved."; toast('Caption saved'); }
-    else { throw new Error(); }
-  }catch(e){ toast('Save failed', false); }
-}
-function clearCaption(){
-  document.getElementById('capText').value = "";
-  document.getElementById('capStatus').textContent = "";
-}
-
-// ----- init -----
-function init(){
-  authNote();
-  const di = document.getElementById('date'); if(!di.value) di.value = todayStr();
-  refresh();
-}
-init();
-</script>
-</body>
-</html>"""
-
-
-# ----------------------------- API ---------------------------------
-
-@app.get("/api/jobs")
-def api_jobs(request: Request, limit: int = 30, status: Optional[str] = None, date: Optional[str] = None):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    return list_jobs(DB_PATH, limit=limit, status=status, date=date)
-
-
-@app.get("/api/results")
-def api_results(request: Request, limit: int = 100, date: Optional[str] = None, job_id: Optional[int] = None):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    return list_results(DB_PATH, limit=limit, date=date, job_id=job_id)
-
-
-@app.post("/api/export/{kind}")
-def api_export(kind: str, body: ExportReq, request: Request):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    date = body.date or _today()
-    jid = enqueue_export_job(DB_PATH, kind=kind, date=date, payload=(body.args or {}))
-    return {"queued": jid, "kind": kind, "date": date}
-
-
-@app.post("/api/export_selected/{kind}")
-def api_export_selected(kind: str, body: ExportSelectedReq, request: Request):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    date = body.date or _today()
-    payload = {"files": body.files, "args": body.args or {}}
-    jid = enqueue_export_job(DB_PATH, kind=kind, date=date, payload=payload)
-    return {"queued": jid, "kind": kind, "date": date, "count": len(body.files)}
-
-
-@app.post("/api/worker/tick")
-def api_worker_tick(request: Request):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    code = run_worker_once(DB_PATH, EXPORTS)
-    return {"ok": (code == 0)}
-
-
-@app.post("/api/worker/drain")
-def api_worker_drain(request: Request, max_loops: int = 50):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    iters = 0
-    while iters < max_loops:
-        q = list_jobs(DB_PATH, limit=1, status="queued")
-        r = list_jobs(DB_PATH, limit=1, status="running")
-        if not q and not r:
-            break
-        run_worker_once(DB_PATH, EXPORTS)
-        iters += 1
-    remaining = len(list_jobs(DB_PATH, limit=1000, status="queued"))
-    return {"ok": True, "iterations": iters, "remaining": remaining}
-
-
-@app.post("/api/queue/all")
-def api_queue_all(body: ExportReq, request: Request):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    date = body.date or _today()
-    kinds = ("pdf", "csv", "pptx", "gif", "mp4", "zip")
-    queued = []
-    for k in kinds:
-        queued.append(enqueue_export_job(DB_PATH, kind=k, date=date, payload=(body.args or {})))
-    return {"ok": True, "date": date, "queued": queued}
-
-
-@app.post("/api/retry_failed")
-def api_retry_failed(request: Request, date: Optional[str] = None):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    date = date or _today()
-    failed = list_jobs(DB_PATH, limit=500, status="failed", date=date)
-    new_ids: List[int] = []
-    for row in failed:
-        kind = (row.get("kind") or "").replace("export:", "")
-        if not kind:
+def read_jsonl(p: Path) -> List[Dict[str, Any]]:
+    if not p.exists():
+        return []
+    items: List[Dict[str, Any]] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
             continue
-        new_ids.append(enqueue_export_job(DB_PATH, kind=kind, date=row.get("date") or date, payload={}))
-    return {"ok": True, "requeued": new_ids, "count": len(new_ids)}
-
-
-@app.get("/api/images")
-def api_images(request: Request, date: Optional[str] = None):
-    """
-    Return list of images under data/runs/<date>/art with safe web URLs.
-    """
-    _require_auth(request)
-    date = date or _today()
-    artdir = ROOT / "data" / "runs" / date / "art"
-    out: List[Dict[str, Any]] = []
-    if artdir.exists():
-        allowed = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".jfif"}
-        for p in sorted(artdir.iterdir()):
-            ext = p.suffix.lower()
-            if ext not in allowed:
-                continue
-            try:
-                st = p.stat()
-                # Path inside the mounted /data root
-                rel = p.relative_to(DATA_MOUNT_ROOT).as_posix()  # e.g. data/runs/2025-10-01/art/x.jpg
-                # URL-quote for safety (spaces, parens…)
-                web = "/data/" + quote(rel, safe="/")
-                out.append({
-                    "name": p.name,
-                    "path": str(p),
-                    "web": web,
-                    "size": st.st_size,
-                    "mtime": st.st_mtime,
-                })
-            except Exception:
-                continue
-    # Sort newest first (optional):
-    out.sort(key=lambda x: x.get("mtime", 0), reverse=True)
-    return out
-
-
-@app.post("/api/caption")
-def api_caption(body: CaptionReq, request: Request):
-    _require_auth(request)
-    date = body.date or _today()
-    rundir = ROOT / "data" / "runs" / date
-    rundir.mkdir(parents=True, exist_ok=True)
-    cap_path = rundir / "captions.json"
-
-    caps: Dict[str, Any] = {}
-    if cap_path.exists():
         try:
-            caps = json.loads(cap_path.read_text(encoding="utf-8"))
+            items.append(json.loads(line))
         except Exception:
-            caps = {}
+            # skip bad line
+            continue
+    return items
 
-    caps[body.path] = {"caption": body.caption or "", "tags": body.tags or ""}
+def write_jsonl(p: Path, items: List[Dict[str, Any]]) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    txt = "\n".join(json.dumps(it, ensure_ascii=False) for it in items) + ("\n" if items else "")
+    p.write_text(txt, encoding="utf-8")
 
-    cap_path.write_text(json.dumps(caps, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"ok": True, "saved": body.path}
+def latest_plan_date(platform: str = "telegram") -> Optional[str]:
+    if not RUNS_DIR.exists():
+        return None
+    dates: List[str] = []
+    for child in RUNS_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        pp = child / PLAN_NAME
+        if not pp.exists():
+            continue
+        # If platform filter, ensure at least one item for that platform exists
+        try:
+            items = read_jsonl(pp)
+            if platform:
+                if any((it.get("platform") or "") == platform for it in items):
+                    dates.append(child.name)
+            else:
+                dates.append(child.name)
+        except Exception:
+            continue
+    dates.sort()
+    return dates[-1] if dates else None
+
+def ensure_ids(items: List[Dict[str, Any]], platform: str) -> List[Dict[str, Any]]:
+    # Guarantee id/topic_id exist (t1,t2,...)
+    used = set()
+    for it in items:
+        if it.get("platform") == platform and it.get("id"):
+            used.add(str(it["id"]))
+    n = 1
+    for it in items:
+        if it.get("platform") != platform:
+            continue
+        if not it.get("id"):
+            while f"t{n}" in used:
+                n += 1
+            it["id"] = f"t{n}"
+            it["topic_id"] = it.get("topic_id") or it["id"]
+            used.add(it["id"])
+            n += 1
+        if not it.get("topic_id"):
+            it["topic_id"] = it["id"]
+    return items
+
+def counts_for(items: List[Dict[str, Any]], platform: str) -> Dict[str, int]:
+    c = {"draft": 0, "approved": 0, "sent": 0}
+    for it in items:
+        if platform and it.get("platform") != platform:
+            continue
+        st = (it.get("status") or "draft").lower()
+        if st not in c:
+            st = "draft"
+        c[st] += 1
+    return c
+
+def filter_items(items: List[Dict[str, Any]], platform: str) -> List[Dict[str, Any]]:
+    if not platform:
+        return items
+    return [it for it in items if (it.get("platform") or "") == platform]
 
 
-# ---------- convenience: make a sample image and queue all ----------
-@app.post("/api/sample")
-def api_sample(request: Request, date: Optional[str] = None):
-    _require_auth(request)
-    ensure_db(DB_PATH)
-    date = date or _today()
-    artdir = ROOT / "data" / "runs" / date / "art"
-    artdir.mkdir(parents=True, exist_ok=True)
-    img = artdir / "sample.png"
-    try:
-        from PIL import Image, ImageDraw  # type: ignore
-        im = Image.new("RGB", (1280, 720), (20, 20, 20))
-        d = ImageDraw.Draw(im)
-        d.text((40, 40), f"AISatyagrah sample — {date}", fill=(240, 240, 240))
-        im.save(img)
-    except Exception:
-        img.write_bytes(b"")
+# ---------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------
+router = APIRouter()
 
-    kinds = ("pdf", "csv", "pptx", "gif", "mp4", "zip")
-    queued = [enqueue_export_job(DB_PATH, kind=k, date=date, payload={}) for k in kinds]
-    return {"ok": True, "date": date, "image": str(img), "queued": queued}
+
+@router.get("/api/health")
+def api_health():
+    return {"ok": True}
+
+@router.get("/api/version")
+def api_version():
+    return {"app": "AISatyagrah Jobs API", "newsroom": True}
+
+@router.get("/favicon.ico")
+def favicon():
+    # avoid noisy 404s
+    return PlainTextResponse("", status_code=204)
+
+
+@router.get("/ui/newsroom", response_class=HTMLResponse)
+def ui_newsroom():
+    p = UI_DIR / "newsroom.html"
+    if not p.exists():
+        raise HTTPException(404, "newsroom.html not found")
+    return FileResponse(str(p))
+
+
+@router.get("/api/newsroom/latest")
+def newsroom_latest(request: Request, platform: str = Query("telegram")):
+    require_auth(request)
+    d = latest_plan_date(platform=platform) or norm_date(None)
+    return {"date": d, "platform": platform}
+
+
+@router.get("/api/newsroom/plan")
+def newsroom_plan(
+    request: Request,
+    date: Optional[str] = Query(None),
+    platform: str = Query("telegram"),
+):
+    require_auth(request)
+    ensure_dirs()
+
+    d = norm_date(date)
+    p = plan_path(d)
+    items = read_jsonl(p)
+    items = ensure_ids(items, platform)
+    write_jsonl(p, items)
+
+    out = filter_items(items, platform)
+    return {
+        "date": d,
+        "platform": platform,
+        "counts": counts_for(items, platform),
+        "items": out,
+    }
+
+
+@router.post("/api/newsroom/status")
+def newsroom_status(
+    request: Request,
+    date: str = Query(...),
+    platform: str = Query("telegram"),
+    payload: Dict[str, Any] = Body(...),
+):
+    require_auth(request)
+    ensure_dirs()
+
+    d = norm_date(date)
+    item_id = str(payload.get("id") or "").strip()
+    new_status = str(payload.get("status") or "").strip().lower()
+
+    if not item_id:
+        raise HTTPException(400, "Missing id")
+    if new_status not in ("draft", "approved", "sent"):
+        raise HTTPException(400, "Invalid status")
+
+    p = plan_path(d)
+    items = read_jsonl(p)
+    changed = 0
+
+    for it in items:
+        if (it.get("platform") or "") == platform and str(it.get("id") or "") == item_id:
+            prev = (it.get("status") or "draft").lower()
+            it["prev_status"] = prev
+            it["status"] = new_status
+            changed = 1
+            break
+
+    write_jsonl(p, ensure_ids(items, platform))
+    return {"date": d, "platform": platform, "id": item_id, "changed": changed, "status": new_status}
+
+
+@router.post("/api/newsroom/undo")
+def newsroom_undo(
+    request: Request,
+    date: str = Query(...),
+    platform: str = Query("telegram"),
+    payload: Dict[str, Any] = Body(...),
+):
+    require_auth(request)
+    d = norm_date(date)
+    item_id = str(payload.get("id") or "").strip()
+    if not item_id:
+        raise HTTPException(400, "Missing id")
+
+    p = plan_path(d)
+    items = read_jsonl(p)
+    changed = 0
+    for it in items:
+        if (it.get("platform") or "") == platform and str(it.get("id") or "") == item_id:
+            prev = (it.get("prev_status") or "draft").lower()
+            if prev not in ("draft", "approved", "sent"):
+                prev = "draft"
+            it["status"] = prev
+            changed = 1
+            break
+
+    write_jsonl(p, ensure_ids(items, platform))
+    return {"date": d, "platform": platform, "id": item_id, "changed": changed}
+
+
+@router.post("/api/newsroom/approve_all")
+def newsroom_approve_all(
+    request: Request,
+    date: str = Query(...),
+    platform: str = Query("telegram"),
+):
+    require_auth(request)
+    ensure_dirs()
+
+    d = norm_date(date)
+    p = plan_path(d)
+    items = read_jsonl(p)
+
+    changed = 0
+    for it in items:
+        if (it.get("platform") or "") != platform:
+            continue
+        st = (it.get("status") or "draft").lower()
+        if st == "draft":
+            it["prev_status"] = st
+            it["status"] = "approved"
+            changed += 1
+
+    write_jsonl(p, ensure_ids(items, platform))
+    return {"date": d, "platform": platform, "approved": changed}
+
+
+@router.post("/api/newsroom/run")
+def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
+    require_auth(request)
+    ensure_dirs()
+
+    d = norm_date(payload.get("date"))
+    platform = str(payload.get("platform") or "telegram").strip()
+    dry_run = bool(payload.get("dry_run", True))
+    confirm = bool(payload.get("confirm", False))
+
+    p = plan_path(d)
+    items = read_jsonl(p)
+    items = ensure_ids(items, platform)
+
+    # candidates: approved (or draft if you really want — we keep approved only)
+    candidates = [
+        it for it in items
+        if (it.get("platform") or "") == platform and (it.get("status") or "draft").lower() == "approved"
+    ]
+
+    sent = 0
+    messages: List[str] = []
+
+    for it in candidates:
+        msg = ""
+        if it.get("title"):
+            msg += str(it["title"]).strip() + "\n"
+        msg += str(it.get("snippet") or "").strip()
+        h = str(it.get("hashtags") or "").strip()
+        if h:
+            msg += "\n" + h
+        msg = msg.strip()
+        messages.append(msg)
+
+        if (not dry_run) and confirm:
+            # Stub: mark as sent (real Telegram send can be wired later)
+            it["prev_status"] = (it.get("status") or "approved").lower()
+            it["status"] = "sent"
+            it["sent_at"] = datetime.utcnow().isoformat() + "Z"
+            sent += 1
+
+    write_jsonl(p, ensure_ids(items, platform))
+
+    return {
+        "date": d,
+        "platform": platform,
+        "dry_run": dry_run,
+        "confirm": confirm,
+        "candidates": len(candidates),
+        "sent": sent,
+        "preview": messages[:50],  # cap
+    }
+
+
+@router.post("/api/newsroom/import_csv")
+async def newsroom_import_csv(
+    request: Request,
+    date: str = Query(...),
+    platform: str = Query("telegram"),
+    file: UploadFile = File(...),
+):
+    require_auth(request)
+    ensure_dirs()
+
+    d = norm_date(date)
+    raw = (await file.read()).decode("utf-8", errors="replace")
+    reader = csv.DictReader(raw.splitlines())
+    incoming: List[Dict[str, Any]] = []
+
+    for row in reader:
+        rid = (row.get("id") or row.get("topic_id") or "").strip() or None
+        topic_id = (row.get("topic_id") or rid or "").strip() or None
+        title = (row.get("title") or "").strip()
+        snippet = (row.get("snippet") or row.get("text") or row.get("caption") or "").strip()
+        hashtags = (row.get("hashtags") or "").strip()
+        status = (row.get("status") or "draft").strip().lower()
+        if status not in ("draft", "approved", "sent"):
+            status = "draft"
+
+        incoming.append({
+            "date": d,
+            "platform": platform,
+            "status": status,
+            "id": rid,
+            "topic_id": topic_id,
+            "title": title,
+            "snippet": snippet,
+            "hashtags": hashtags,
+        })
+
+    p = plan_path(d)
+    items = read_jsonl(p)
+
+    # Merge by (platform,id) when id exists
+    idx: Dict[Tuple[str, str], int] = {}
+    for i, it in enumerate(items):
+        pid = str(it.get("id") or "").strip()
+        if pid and (it.get("platform") or ""):
+            idx[(it["platform"], pid)] = i
+
+    added = 0
+    updated = 0
+    for it in incoming:
+        pid = str(it.get("id") or "").strip()
+        key = (platform, pid) if pid else None
+        if key and key in idx:
+            items[idx[key]].update(it)
+            updated += 1
+        else:
+            items.append(it)
+            added += 1
+
+    items = ensure_ids(items, platform)
+    write_jsonl(p, items)
+
+    return {"date": d, "platform": platform, "added": added, "updated": updated, "total": len(filter_items(items, platform))}
+
+
+@router.get("/api/newsroom/ig_captions")
+def newsroom_ig_captions(
+    request: Request,
+    date: Optional[str] = Query(None),
+):
+    require_auth(request)
+    ensure_dirs()
+
+    d = norm_date(date)
+    p = plan_path(d)
+    items = read_jsonl(p)
+
+    # simple captions file: one per line (title + snippet + hashtags)
+    lines: List[str] = []
+    for it in items:
+        if (it.get("platform") or "") != "instagram":
+            continue
+        st = (it.get("status") or "draft").lower()
+        if st not in ("approved", "sent"):
+            continue
+        cap = ""
+        if it.get("title"):
+            cap += str(it["title"]).strip() + "\n"
+        cap += str(it.get("snippet") or "").strip()
+        h = str(it.get("hashtags") or "").strip()
+        if h:
+            cap += "\n" + h
+        cap = cap.strip()
+        if cap:
+            lines.append(cap)
+
+    if not lines:
+        lines = ["(no instagram captions for this date)"]
+
+    txt = "\n\n---\n\n".join(lines) + "\n"
+    fn = f"instagram_captions_{d}.txt"
+    headers = {"Content-Disposition": f'attachment; filename="{fn}"'}
+    return PlainTextResponse(txt, headers=headers)
+
+
+def create_app() -> FastAPI:
+    ensure_dirs()
+    app = FastAPI(title="AISatyagrah Jobs API")
+
+    # Static UI assets
+    app.mount("/ui-static", StaticFiles(directory=str(UI_DIR)), name="ui-static")
+
+    # API routes
+    app.include_router(router)
+
+    return app
+
+
+# uvicorn satyagrah.web.jobs_api:app
+app = create_app()
