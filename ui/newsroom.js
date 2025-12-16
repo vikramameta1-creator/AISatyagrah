@@ -224,15 +224,34 @@
     await loadPlan();
   }
 
-  async function igCaptions() {
-    savePrefs();
-    const date = elDate.value || "";
-    const qs = new URLSearchParams();
-    if (date) qs.set("date", date);
+  async function igCaptions(){
+  savePrefs();
+  const d = elDate.value || "";
+  const qs = new URLSearchParams();
+  if (d) qs.set("date", d);
 
-    // trigger download
-    window.open(`/api/newsroom/ig_captions?${qs.toString()}`, "_blank");
+  const h = {};
+  const t = token();
+  if (t) h["x-auth"] = t;
+
+  const res = await fetch(`/api/newsroom/ig_captions?${qs.toString()}`, { headers: h });
+  if (!res.ok) {
+    const msg = await res.text().catch(()=> "");
+    throw new Error(msg || `HTTP ${res.status}`);
   }
+
+  const blob = await res.blob();
+  const fn = d ? `instagram_captions_${d}.txt` : `instagram_captions.txt`;
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = fn;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 1500);
+}
+
 
   async function cycleStatus(id) {
     const platform = elPlatform.value || "telegram";
