@@ -21,3 +21,6 @@ exports/archive/
 Thumbs.db
 .vscode/
 .idea/
+
+.auth_token
+
