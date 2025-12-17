@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+﻿# satyagrah/web/jobs_api.py
+from __future__ import annotations
 
 import csv
 import json
@@ -8,12 +9,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, APIRouter, Request, UploadFile, File, HTTPException, Query, Body
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-
 # ---------------------------------------------------------------------
-# Paths (this file is: <ROOT>\satyagrah\web\jobs_api.py)
+# Paths (this file is: \satyagrah\web\jobs_api.py)
 # ---------------------------------------------------------------------
 THIS_FILE = Path(__file__).resolve()
 ROOT_DIR = THIS_FILE.parents[2]
@@ -21,15 +21,17 @@ UI_DIR = ROOT_DIR / "ui"
 RUNS_DIR = ROOT_DIR / "data" / "runs"
 PLAN_NAME = "newsroom_plan.jsonl"
 
-
 # ---------------------------------------------------------------------
 # Auth: if AUTH_TOKEN env var set, require x-auth header (or Bearer)
 # ---------------------------------------------------------------------
 def _required_token() -> str:
     return (os.getenv("AUTH_TOKEN") or "").strip()
 
+def _auth_enabled() -> bool:
+    return bool(_required_token())
+
 def _get_request_token(req: Request) -> str:
-    # Prefer x-auth header, fallback to Authorization: Bearer <token>
+    # Prefer x-auth header, fallback to Authorization: Bearer
     tok = (req.headers.get("x-auth") or "").strip()
     if tok:
         return tok
@@ -45,7 +47,6 @@ def require_auth(req: Request) -> None:
     got = _get_request_token(req)
     if not got or got != need:
         raise HTTPException(status_code=401, detail="Invalid or missing x-auth token")
-
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -76,7 +77,6 @@ def read_jsonl(p: Path) -> List[Dict[str, Any]]:
         try:
             items.append(json.loads(line))
         except Exception:
-            # skip bad line
             continue
     return items
 
@@ -95,7 +95,6 @@ def latest_plan_date(platform: str = "telegram") -> Optional[str]:
         pp = child / PLAN_NAME
         if not pp.exists():
             continue
-        # If platform filter, ensure at least one item for that platform exists
         try:
             items = read_jsonl(pp)
             if platform:
@@ -109,11 +108,11 @@ def latest_plan_date(platform: str = "telegram") -> Optional[str]:
     return dates[-1] if dates else None
 
 def ensure_ids(items: List[Dict[str, Any]], platform: str) -> List[Dict[str, Any]]:
-    # Guarantee id/topic_id exist (t1,t2,...)
     used = set()
     for it in items:
         if it.get("platform") == platform and it.get("id"):
             used.add(str(it["id"]))
+
     n = 1
     for it in items:
         if it.get("platform") != platform:
@@ -145,12 +144,10 @@ def filter_items(items: List[Dict[str, Any]], platform: str) -> List[Dict[str, A
         return items
     return [it for it in items if (it.get("platform") or "") == platform]
 
-
 # ---------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------
 router = APIRouter()
-
 
 @router.get("/api/health")
 def api_health():
@@ -160,26 +157,34 @@ def api_health():
 def api_version():
     return {"app": "AISatyagrah Jobs API", "newsroom": True}
 
+# ✅ Phase 1 (Step 9): auth probe endpoint (no auth required)
+@router.get("/api/auth/enabled")
+def api_auth_enabled():
+    return {"enabled": _auth_enabled(), "header": "x-auth"}
+
 @router.get("/favicon.ico")
 def favicon():
-    # avoid noisy 404s
     return PlainTextResponse("", status_code=204)
-
 
 @router.get("/ui/newsroom", response_class=HTMLResponse)
 def ui_newsroom():
     p = UI_DIR / "newsroom.html"
     if not p.exists():
         raise HTTPException(404, "newsroom.html not found")
-    return FileResponse(str(p))
-
+    # No-cache so you always see latest UI while developing
+    return FileResponse(
+        str(p),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 @router.get("/api/newsroom/latest")
 def newsroom_latest(request: Request, platform: str = Query("telegram")):
     require_auth(request)
     d = latest_plan_date(platform=platform) or norm_date(None)
     return {"date": d, "platform": platform}
-
 
 @router.get("/api/newsroom/plan")
 def newsroom_plan(
@@ -189,13 +194,11 @@ def newsroom_plan(
 ):
     require_auth(request)
     ensure_dirs()
-
     d = norm_date(date)
     p = plan_path(d)
     items = read_jsonl(p)
     items = ensure_ids(items, platform)
     write_jsonl(p, items)
-
     out = filter_items(items, platform)
     return {
         "date": d,
@@ -204,6 +207,37 @@ def newsroom_plan(
         "items": out,
     }
 
+@router.get("/api/newsroom/metrics")
+def newsroom_metrics(
+    request: Request,
+    date: Optional[str] = Query(None),
+    platform: str = Query("telegram"),
+):
+    require_auth(request)
+    ensure_dirs()
+    d = norm_date(date)
+    p = plan_path(d)
+    items = read_jsonl(p)
+    items = ensure_ids(items, platform)
+    write_jsonl(p, items)
+    return {
+        "date": d,
+        "platform": platform,
+        "auth_enabled": _auth_enabled(),
+        "counts": counts_for(items, platform),
+        "total_platform_items": len(filter_items(items, platform)),
+        "plan_file": str(p),
+    }
+
+@router.get("/api/newsroom/logs")
+def newsroom_logs(request: Request, date: Optional[str] = Query(None)):
+    require_auth(request)
+    ensure_dirs()
+    d = norm_date(date)
+    p = run_dir(d) / "logs.jsonl"
+    if not p.exists():
+        return PlainTextResponse("(no logs.jsonl for this date)\n", status_code=200)
+    return PlainTextResponse(p.read_text(encoding="utf-8", errors="replace") + "\n")
 
 @router.post("/api/newsroom/status")
 def newsroom_status(
@@ -214,11 +248,9 @@ def newsroom_status(
 ):
     require_auth(request)
     ensure_dirs()
-
     d = norm_date(date)
     item_id = str(payload.get("id") or "").strip()
     new_status = str(payload.get("status") or "").strip().lower()
-
     if not item_id:
         raise HTTPException(400, "Missing id")
     if new_status not in ("draft", "approved", "sent"):
@@ -226,8 +258,8 @@ def newsroom_status(
 
     p = plan_path(d)
     items = read_jsonl(p)
-    changed = 0
 
+    changed = 0
     for it in items:
         if (it.get("platform") or "") == platform and str(it.get("id") or "") == item_id:
             prev = (it.get("status") or "draft").lower()
@@ -238,7 +270,6 @@ def newsroom_status(
 
     write_jsonl(p, ensure_ids(items, platform))
     return {"date": d, "platform": platform, "id": item_id, "changed": changed, "status": new_status}
-
 
 @router.post("/api/newsroom/undo")
 def newsroom_undo(
@@ -255,6 +286,7 @@ def newsroom_undo(
 
     p = plan_path(d)
     items = read_jsonl(p)
+
     changed = 0
     for it in items:
         if (it.get("platform") or "") == platform and str(it.get("id") or "") == item_id:
@@ -268,16 +300,10 @@ def newsroom_undo(
     write_jsonl(p, ensure_ids(items, platform))
     return {"date": d, "platform": platform, "id": item_id, "changed": changed}
 
-
 @router.post("/api/newsroom/approve_all")
-def newsroom_approve_all(
-    request: Request,
-    date: str = Query(...),
-    platform: str = Query("telegram"),
-):
+def newsroom_approve_all(request: Request, date: str = Query(...), platform: str = Query("telegram")):
     require_auth(request)
     ensure_dirs()
-
     d = norm_date(date)
     p = plan_path(d)
     items = read_jsonl(p)
@@ -295,12 +321,10 @@ def newsroom_approve_all(
     write_jsonl(p, ensure_ids(items, platform))
     return {"date": d, "platform": platform, "approved": changed}
 
-
 @router.post("/api/newsroom/run")
 def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
     require_auth(request)
     ensure_dirs()
-
     d = norm_date(payload.get("date"))
     platform = str(payload.get("platform") or "telegram").strip()
     dry_run = bool(payload.get("dry_run", True))
@@ -310,9 +334,9 @@ def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
     items = read_jsonl(p)
     items = ensure_ids(items, platform)
 
-    # candidates: approved (or draft if you really want — we keep approved only)
     candidates = [
-        it for it in items
+        it
+        for it in items
         if (it.get("platform") or "") == platform and (it.get("status") or "draft").lower() == "approved"
     ]
 
@@ -331,14 +355,12 @@ def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
         messages.append(msg)
 
         if (not dry_run) and confirm:
-            # Stub: mark as sent (real Telegram send can be wired later)
             it["prev_status"] = (it.get("status") or "approved").lower()
             it["status"] = "sent"
             it["sent_at"] = datetime.utcnow().isoformat() + "Z"
             sent += 1
 
     write_jsonl(p, ensure_ids(items, platform))
-
     return {
         "date": d,
         "platform": platform,
@@ -346,9 +368,8 @@ def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
         "confirm": confirm,
         "candidates": len(candidates),
         "sent": sent,
-        "preview": messages[:50],  # cap
+        "preview": messages[:50],
     }
-
 
 @router.post("/api/newsroom/import_csv")
 async def newsroom_import_csv(
@@ -359,12 +380,12 @@ async def newsroom_import_csv(
 ):
     require_auth(request)
     ensure_dirs()
-
     d = norm_date(date)
+
     raw = (await file.read()).decode("utf-8", errors="replace")
     reader = csv.DictReader(raw.splitlines())
-    incoming: List[Dict[str, Any]] = []
 
+    incoming: List[Dict[str, Any]] = []
     for row in reader:
         rid = (row.get("id") or row.get("topic_id") or "").strip() or None
         topic_id = (row.get("topic_id") or rid or "").strip() or None
@@ -375,21 +396,22 @@ async def newsroom_import_csv(
         if status not in ("draft", "approved", "sent"):
             status = "draft"
 
-        incoming.append({
-            "date": d,
-            "platform": platform,
-            "status": status,
-            "id": rid,
-            "topic_id": topic_id,
-            "title": title,
-            "snippet": snippet,
-            "hashtags": hashtags,
-        })
+        incoming.append(
+            {
+                "date": d,
+                "platform": platform,
+                "status": status,
+                "id": rid,
+                "topic_id": topic_id,
+                "title": title,
+                "snippet": snippet,
+                "hashtags": hashtags,
+            }
+        )
 
     p = plan_path(d)
     items = read_jsonl(p)
 
-    # Merge by (platform,id) when id exists
     idx: Dict[Tuple[str, str], int] = {}
     for i, it in enumerate(items):
         pid = str(it.get("id") or "").strip()
@@ -413,20 +435,14 @@ async def newsroom_import_csv(
 
     return {"date": d, "platform": platform, "added": added, "updated": updated, "total": len(filter_items(items, platform))}
 
-
 @router.get("/api/newsroom/ig_captions")
-def newsroom_ig_captions(
-    request: Request,
-    date: Optional[str] = Query(None),
-):
+def newsroom_ig_captions(request: Request, date: Optional[str] = Query(None)):
     require_auth(request)
     ensure_dirs()
-
     d = norm_date(date)
     p = plan_path(d)
     items = read_jsonl(p)
 
-    # simple captions file: one per line (title + snippet + hashtags)
     lines: List[str] = []
     for it in items:
         if (it.get("platform") or "") != "instagram":
@@ -434,6 +450,7 @@ def newsroom_ig_captions(
         st = (it.get("status") or "draft").lower()
         if st not in ("approved", "sent"):
             continue
+
         cap = ""
         if it.get("title"):
             cap += str(it["title"]).strip() + "\n"
@@ -453,19 +470,15 @@ def newsroom_ig_captions(
     headers = {"Content-Disposition": f'attachment; filename="{fn}"'}
     return PlainTextResponse(txt, headers=headers)
 
-
 def create_app() -> FastAPI:
     ensure_dirs()
     app = FastAPI(title="AISatyagrah Jobs API")
 
-    # Static UI assets
+    # Static UI assets: /ui-static/newsroom.css, /ui-static/newsroom.js
     app.mount("/ui-static", StaticFiles(directory=str(UI_DIR)), name="ui-static")
 
-    # API routes
     app.include_router(router)
-
     return app
-
 
 # uvicorn satyagrah.web.jobs_api:app
 app = create_app()

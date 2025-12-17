@@ -1,114 +1,84 @@
-﻿<!doctype html>
+﻿<!-- ui/newsroom.html -->
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>AISatyagrah — Newsroom</title>
-  <style>
-    :root{
-      --bg:#0b1020; --panel:#121a33; --panel2:#0f1730;
-      --text:#e7ecff; --muted:#a6b0d8;
-      --btn:#26325f; --btn2:#2e3a70; --accent:#6c7cff;
-      --danger:#ff5b5b; --ok:#18d17e; --warn:#ffd166;
-      --stroke:rgba(255,255,255,.10);
-      --shadow: 0 10px 30px rgba(0,0,0,.35);
-      --r:14px;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    }
-    body{ margin:0; background:radial-gradient(1200px 700px at 20% 0%, #1a2655 0%, var(--bg) 55%); color:var(--text); }
-    .wrap{ padding:18px 18px 24px; }
-    h1{ margin:0 0 14px; font-size:34px; letter-spacing:.2px; color:#eaf0ff; opacity:.92;}
-    .bar{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:12px; background:rgba(18,26,51,.72); border:1px solid var(--stroke); border-radius:var(--r); box-shadow:var(--shadow);}
-    .bar .sp{ flex:1; }
-    input, select{
-      background:rgba(10,14,30,.75); color:var(--text);
-      border:1px solid var(--stroke); border-radius:12px;
-      padding:10px 12px; outline:none;
-    }
-    input::placeholder{ color:rgba(231,236,255,.45); }
-    .btn{
-      border:1px solid var(--stroke);
-      background:linear-gradient(180deg, var(--btn2), var(--btn));
-      color:var(--text); padding:10px 14px; border-radius:12px;
-      cursor:pointer; user-select:none;
-    }
-    .btn:hover{ filter:brightness(1.08); }
-    .btn.danger{ background:linear-gradient(180deg, #ff6a6a, #d54242); border-color:rgba(255,255,255,.18); }
-    .btn.ghost{ background:rgba(10,14,30,.55); }
-    .tabs{ display:flex; gap:8px; padding:10px 0 0; }
-    .tab{ padding:9px 14px; border-radius:999px; border:1px solid var(--stroke); background:rgba(18,26,51,.55); cursor:pointer; color:var(--text); }
-    .tab.active{ outline:2px solid rgba(108,124,255,.45); }
-    #kpi{ padding:12px 2px; color:var(--muted); }
-    .grid{ display:grid; grid-template-columns:repeat(3, minmax(260px, 1fr)); gap:14px; }
-    @media (max-width: 1100px){ .grid{ grid-template-columns:repeat(2, minmax(260px,1fr)); } }
-    @media (max-width: 760px){ .grid{ grid-template-columns:1fr; } }
-    .card{
-      background:linear-gradient(180deg, rgba(18,26,51,.78), rgba(10,14,30,.70));
-      border:1px solid var(--stroke);
-      border-radius:18px;
-      padding:14px; box-shadow:var(--shadow);
-      min-height:140px;
-      display:flex; flex-direction:column; gap:10px;
-    }
-    .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    .pill{ font-size:12px; padding:5px 10px; border-radius:999px; border:1px solid var(--stroke); background:rgba(255,255,255,.06); color:var(--text); }
-    .pill.ok{ background:rgba(24,209,126,.12); border-color:rgba(24,209,126,.25); }
-    .pill.warn{ background:rgba(255,209,102,.12); border-color:rgba(255,209,102,.25); }
-    .pill.sent{ background:rgba(108,124,255,.12); border-color:rgba(108,124,255,.25); }
-    .title{ font-weight:700; font-size:18px; margin-top:2px;}
-    .snippet{ color:rgba(231,236,255,.78); line-height:1.35; white-space:pre-wrap; }
-    .foot{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:auto; }
-    .mini{ font-size:12px; color:rgba(231,236,255,.55); }
-    #toast{
-      position:fixed; right:18px; bottom:18px; background:rgba(18,26,51,.92);
-      border:1px solid var(--stroke); border-radius:14px; padding:12px 14px;
-      box-shadow:var(--shadow); display:none; max-width:520px;
-    }
-  </style>
+  <link rel="stylesheet" href="/ui-static/newsroom.css" />
 </head>
 <body>
   <div class="wrap">
-    <h1>AISatyagrah — Newsroom</h1>
+    <header class="top">
+      <h1>AISatyagrah — Newsroom</h1>
 
-    <div class="bar">
-      <input id="token" style="min-width:260px" placeholder="x-auth token (optional)" />
-      <select id="platform">
-        <option value="telegram">telegram</option>
-        <option value="instagram">instagram</option>
-      </select>
-      <input id="date" type="date" />
+      <div class="toolbar">
+        <div class="tokenBox">
+          <input id="tokenInput" type="password" placeholder="x-auth token (optional when AUTH OFF)" />
+          <button id="saveTokenBtn" class="btn">Save token</button>
+          <button id="clearTokenBtn" class="btn btnGhost">Clear</button>
+          <span id="authBadge" class="badge badgeOff" title="Server auth status">AUTH ?</span>
+        </div>
 
-      <button class="btn" id="loadPlan">Load plan</button>
-      <button class="btn" id="latestTelegram">Latest telegram</button>
+        <div class="controls">
+          <select id="platformSel" class="ctl">
+            <option value="telegram">telegram</option>
+            <option value="instagram">instagram</option>
+          </select>
 
-      <button class="btn ghost" id="browseBtn">Browse…</button>
-      <input id="csv" type="file" accept=".csv" style="display:none" />
-      <button class="btn" id="importCsv">Import CSV</button>
+          <input id="dateInput" class="ctl" type="date" />
 
-      <button class="btn" id="approveAll">Approve All</button>
-      <button class="btn" id="dryRun">Dry-Run</button>
-      <button class="btn danger" id="publish">Publish (confirm)</button>
-      <button class="btn" id="igCaptions">IG captions</button>
+          <button id="loadPlanBtn" class="btn">Load plan</button>
+          <button id="latestBtn" class="btn btnGhost">Latest</button>
 
-      <span class="sp"></span>
+          <button id="browseBtn" class="btn btnGhost" title="Downloads the current plan JSON">Browse…</button>
 
-      <input id="q" style="min-width:220px" placeholder="search…" />
-      <button class="btn" id="doSearch">Search</button>
+          <input id="csvFile" type="file" accept=".csv" style="display:none" />
+          <button id="importBtn" class="btn btnGhost">Import CSV</button>
+
+          <button id="approveAllBtn" class="btn">Approve All</button>
+          <button id="dryRunBtn" class="btn">Dry-Run</button>
+
+          <button id="publishBtn" class="btn btnDanger">Publish (confirm)</button>
+          <button id="igCaptionsBtn" class="btn btnGhost">IG captions</button>
+
+          <button id="logsBtn" class="btn btnGhost">Logs</button>
+          <button id="metricsBtn" class="btn btnGhost">Metrics</button>
+          <button id="copyCurlBtn" class="btn btnGhost" title="Copies the last request as curl">Copy curl</button>
+        </div>
+
+        <div class="searchBox">
+          <input id="searchInput" class="ctl" placeholder="search…" />
+          <button id="searchBtn" class="btn btnGhost">Search</button>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button id="tabAll" class="tab tabOn">All</button>
+        <button id="tabDraft" class="tab">Draft</button>
+        <button id="tabApproved" class="tab">Approved</button>
+        <button id="tabSent" class="tab">Sent</button>
+        <div id="statusLine" class="statusLine"></div>
+      </div>
+    </header>
+
+    <main>
+      <div id="cards" class="cards"></div>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <div id="modal" class="modal hidden">
+      <div class="modalCard">
+        <div class="modalHead">
+          <div id="modalTitle" class="modalTitle">Info</div>
+          <button id="modalClose" class="btn btnGhost">Close</button>
+        </div>
+        <pre id="modalBody" class="modalBody"></pre>
+      </div>
     </div>
-
-    <div class="tabs">
-      <div class="tab active" id="tabAll">All</div>
-      <div class="tab" id="tabDraft">Draft</div>
-      <div class="tab" id="tabApproved">Approved</div>
-      <div class="tab" id="tabSent">Sent</div>
-    </div>
-
-    <div id="kpi">Ready.</div>
-    <div id="items" class="grid"></div>
   </div>
 
-  <div id="toast"></div>
-
-  <script src="/ui-static/newsroom.js?v=1"></script>
+  <script src="/ui-static/newsroom.js"></script>
 </body>
 </html>
