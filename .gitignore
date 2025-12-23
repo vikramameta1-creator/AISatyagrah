@@ -23,3 +23,9 @@ __pycache__/
 *.pem
 secrets/
 **/secrets/
+# secrets
+.auth_token
+.auth_totp_secret
+.env
+.env.*
+*.secrets.*
