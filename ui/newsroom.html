@@ -1,84 +1,52 @@
-﻿<!-- ui/newsroom.html -->
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AISatyagrah — Newsroom</title>
-  <link rel="stylesheet" href="/ui-static/newsroom.css" />
+  <title>AISatyagrah • Newsroom</title>
+  <link rel="stylesheet" href="/ui/newsroom.css?v=10" />
 </head>
 <body>
-  <div class="wrap">
-    <header class="top">
-      <h1>AISatyagrah — Newsroom</h1>
-
-      <div class="toolbar">
-        <div class="tokenBox">
-          <input id="tokenInput" type="password" placeholder="x-auth token (optional when AUTH OFF)" />
-          <button id="saveTokenBtn" class="btn">Save token</button>
-          <button id="clearTokenBtn" class="btn btnGhost">Clear</button>
-          <span id="authBadge" class="badge badgeOff" title="Server auth status">AUTH ?</span>
-        </div>
-
-        <div class="controls">
-          <select id="platformSel" class="ctl">
-            <option value="telegram">telegram</option>
-            <option value="instagram">instagram</option>
-          </select>
-
-          <input id="dateInput" class="ctl" type="date" />
-
-          <button id="loadPlanBtn" class="btn">Load plan</button>
-          <button id="latestBtn" class="btn btnGhost">Latest</button>
-
-          <button id="browseBtn" class="btn btnGhost" title="Downloads the current plan JSON">Browse…</button>
-
-          <input id="csvFile" type="file" accept=".csv" style="display:none" />
-          <button id="importBtn" class="btn btnGhost">Import CSV</button>
-
-          <button id="approveAllBtn" class="btn">Approve All</button>
-          <button id="dryRunBtn" class="btn">Dry-Run</button>
-
-          <button id="publishBtn" class="btn btnDanger">Publish (confirm)</button>
-          <button id="igCaptionsBtn" class="btn btnGhost">IG captions</button>
-
-          <button id="logsBtn" class="btn btnGhost">Logs</button>
-          <button id="metricsBtn" class="btn btnGhost">Metrics</button>
-          <button id="copyCurlBtn" class="btn btnGhost" title="Copies the last request as curl">Copy curl</button>
-        </div>
-
-        <div class="searchBox">
-          <input id="searchInput" class="ctl" placeholder="search…" />
-          <button id="searchBtn" class="btn btnGhost">Search</button>
-        </div>
-      </div>
-
-      <div class="tabs">
-        <button id="tabAll" class="tab tabOn">All</button>
-        <button id="tabDraft" class="tab">Draft</button>
-        <button id="tabApproved" class="tab">Approved</button>
-        <button id="tabSent" class="tab">Sent</button>
-        <div id="statusLine" class="statusLine"></div>
-      </div>
-    </header>
-
-    <main>
-      <div id="cards" class="cards"></div>
-    </main>
-
-    <div id="toast" class="toast hidden"></div>
-
-    <div id="modal" class="modal hidden">
-      <div class="modalCard">
-        <div class="modalHead">
-          <div id="modalTitle" class="modalTitle">Info</div>
-          <button id="modalClose" class="btn btnGhost">Close</button>
-        </div>
-        <pre id="modalBody" class="modalBody"></pre>
-      </div>
+  <header class="top">
+    <div class="left">
+      <h1>Newsroom</h1>
+      <div class="sub">Local Jobs API • plan / approve / publish</div>
     </div>
-  </div>
 
-  <script src="/ui-static/newsroom.js"></script>
+    <div class="right">
+      <div id="authPill" class="pill">auth: unknown</div>
+      <input id="tokenInput" class="token" placeholder="x-auth token (optional)" />
+      <button id="saveTokenBtn" class="btn">Save Token</button>
+      <button id="clearTokenBtn" class="btn ghost">Clear</button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="row">
+        <label>Date</label>
+        <input id="dateInput" type="date" />
+        <label>Platform</label>
+        <select id="platformInput">
+          <option value="all">all</option>
+          <option value="telegram">telegram</option>
+          <option value="instagram">instagram</option>
+        </select>
+
+        <button id="loadPlanBtn" class="btn">Load Plan</button>
+        <button id="approveAllBtn" class="btn ghost">Approve All</button>
+        <button id="dryRunBtn" class="btn ghost">Dry Run</button>
+        <button id="publishBtn" class="btn danger">Publish</button>
+      </div>
+
+      <div id="statusLine" class="status">Ready.</div>
+    </section>
+
+    <section id="items" class="items">
+      <div class="empty">No items yet.</div>
+    </section>
+  </main>
+
+  <script src="/ui/newsroom.js?v=10"></script>
 </body>
 </html>

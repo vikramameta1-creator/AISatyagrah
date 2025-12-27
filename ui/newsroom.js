@@ -1,515 +1,249 @@
-﻿// ui/newsroom.js
-(() => {
-  const $ = (id) => document.getElementById(id);
+/* ui/newsroom.js (no BOM)
+   Minimal, reliable Newsroom UI client.
+   - Calls /api/newsroom/plan, /api/newsroom/run, /api/newsroom/status
+   - Sends x-auth header if token saved in localStorage
+*/
 
-  const els = {
-    token: $("tokenInput"),
-    saveToken: $("saveTokenBtn"),
-    clearToken: $("clearTokenBtn"),
-    authBadge: $("authBadge"),
+const AUTH_HEADER = "x-auth";
+const LS_TOKEN_KEY = "AISATYAGRAH_XAUTH";
 
-    platform: $("platformSel"),
-    date: $("dateInput"),
+const $ = (sel) => document.querySelector(sel);
 
-    loadPlan: $("loadPlanBtn"),
-    latest: $("latestBtn"),
-    browse: $("browseBtn"),
-    importBtn: $("importBtn"),
-    csvFile: $("csvFile"),
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
 
-    approveAll: $("approveAllBtn"),
-    dryRun: $("dryRunBtn"),
-    publish: $("publishBtn"),
-    igCaptions: $("igCaptionsBtn"),
-    logs: $("logsBtn"),
-    metrics: $("metricsBtn"),
-    copyCurl: $("copyCurlBtn"),
+function setStatusLine(msg) {
+  const el = $("#statusLine");
+  if (el) el.textContent = msg;
+}
 
-    q: $("searchInput"),
-    search: $("searchBtn"),
+function getSavedToken() {
+  return (localStorage.getItem(LS_TOKEN_KEY) || "").trim();
+}
+function saveToken(t) {
+  t = (t || "").trim();
+  if (t) localStorage.setItem(LS_TOKEN_KEY, t);
+  else localStorage.removeItem(LS_TOKEN_KEY);
+}
 
-    tabAll: $("tabAll"),
-    tabDraft: $("tabDraft"),
-    tabApproved: $("tabApproved"),
-    tabSent: $("tabSent"),
+function getDateValue() {
+  const el = $("#dateInput");
+  return (el && el.value) ? el.value : todayISO();
+}
 
-    statusLine: $("statusLine"),
-    cards: $("cards"),
+function getPlatformValue() {
+  const el = $("#platformInput");
+  return (el && el.value) ? el.value : "all";
+}
 
-    toast: $("toast"),
-    modal: $("modal"),
-    modalTitle: $("modalTitle"),
-    modalBody: $("modalBody"),
-    modalClose: $("modalClose"),
-  };
+async function apiFetch(path, opts = {}) {
+  const headers = new Headers(opts.headers || {});
+  const tok = getSavedToken();
+  if (tok) headers.set(AUTH_HEADER, tok);
 
-  const LS_KEY = "xauth";
+  const res = await fetch(path, { ...opts, headers });
 
-  const state = {
-    authEnabled: null,      // null until probed
-    lastReq: null,          // {method,url,headers,body}
-    busy: false,
-    suppress401Until: 0,
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { /* ignore */ }
 
-    plan: {
-      date: "",
-      platform: "telegram",
-      counts: { draft: 0, approved: 0, sent: 0 },
-      items: [],
-    },
-
-    filter: "all",
-    query: "",
-  };
-
-  // ---------------- Toast / Modal ----------------
-  function toast(msg, ms = 2400) {
-    els.toast.textContent = msg;
-    els.toast.classList.remove("hidden");
-    window.clearTimeout(toast._t);
-    toast._t = window.setTimeout(() => els.toast.classList.add("hidden"), ms);
+  if (!res.ok) {
+    const detail = (data && data.detail) ? data.detail : text || `${res.status} ${res.statusText}`;
+    throw new Error(detail);
   }
+  return data;
+}
 
-  function toast401Once() {
-    const now = Date.now();
-    if (now < state.suppress401Until) return;
-    state.suppress401Until = now + 5000;
-    toast("Token missing/invalid (401). Save the correct token or run server with AUTH OFF.", 4200);
-  }
-
-  function openModal(title, body) {
-    els.modalTitle.textContent = title;
-    els.modalBody.textContent = body || "";
-    els.modal.classList.remove("hidden");
-  }
-  function closeModal() {
-    els.modal.classList.add("hidden");
-  }
-
-  // ---------------- Auth helpers ----------------
-  function readToken() {
-    return (els.token.value || "").trim();
-  }
-  function loadTokenFromLocalStorage() {
-    const t = (localStorage.getItem(LS_KEY) || "").trim();
-    if (t) els.token.value = t;
-  }
-  function saveTokenToLocalStorage() {
-    const t = readToken();
-    if (!t) {
-      toast("Token is empty (nothing saved).");
-      return;
-    }
-    localStorage.setItem(LS_KEY, t);
-    toast("Token saved.");
-  }
-  function clearToken() {
-    localStorage.removeItem(LS_KEY);
-    els.token.value = "";
-    toast("Token cleared.");
-  }
-
-  function setAuthBadge(enabled) {
-    if (enabled) {
-      els.authBadge.textContent = "AUTH ON";
-      els.authBadge.classList.remove("badgeOff");
-      els.authBadge.classList.add("badgeOn");
+async function refreshAuthBanner() {
+  const pill = $("#authPill");
+  try {
+    const data = await apiFetch("/api/auth/enabled");
+    if (!pill) return;
+    if (data.enabled) {
+      pill.textContent = `auth: ON • ${data.header}`;
+      pill.classList.add("ok");
     } else {
-      els.authBadge.textContent = "AUTH OFF";
-      els.authBadge.classList.remove("badgeOn");
-      els.authBadge.classList.add("badgeOff");
+      pill.textContent = `auth: OFF`;
+      pill.classList.remove("ok");
     }
+  } catch {
+    if (pill) pill.textContent = `auth: unknown`;
+  }
+}
+
+function renderItems(items) {
+  const root = $("#items");
+  if (!root) return;
+
+  root.innerHTML = "";
+  if (!items || items.length === 0) {
+    const div = document.createElement("div");
+    div.className = "empty";
+    div.textContent = "No items in plan for this date.";
+    root.appendChild(div);
+    return;
   }
 
-  // ✅ Step 10: probe auth once on load
-  async function probeAuthEnabled() {
-    try {
-      const r = await fetch("/api/auth/enabled", { cache: "no-store" });
-      const j = await r.json();
-      state.authEnabled = !!j.enabled;
-      setAuthBadge(state.authEnabled);
-    } catch (e) {
-      state.authEnabled = null;
-      els.authBadge.textContent = "AUTH ?";
-      els.authBadge.classList.add("badgeOff");
-    }
-  }
+  for (const it of items) {
+    const card = document.createElement("div");
+    card.className = "card";
 
-  function authHeaders() {
-    const h = {};
-    const t = readToken();
-    if (t) h["x-auth"] = t;
-    return h;
-  }
+    const title = (it.title || it.topic || "(untitled)").toString();
+    const platform = (it.platform || "unknown").toString();
+    const id = (it.id || "").toString();
+    const status = (it.status || "draft").toString().toLowerCase();
 
-  // ---------------- Request wrappers ----------------
-  async function apiFetch(url, opts = {}) {
-    const method = (opts.method || "GET").toUpperCase();
-    const headers = Object.assign({}, opts.headers || {}, authHeaders());
+    const badge = document.createElement("span");
+    badge.className = "badge dim";
+    badge.textContent = status;
+    if (status === "approved") badge.classList.add("warn");
+    if (status === "sent") badge.classList.add("ok");
 
-    // record last request (for Copy curl)
-    state.lastReq = {
-      method,
-      url,
-      headers,
-      body: opts.body || null,
+    const top = document.createElement("div");
+    top.className = "cardTop";
+
+    const left = document.createElement("div");
+    left.innerHTML = `<div class="title">${escapeHtml(title)}</div>
+      <div class="meta">platform=${escapeHtml(platform)} • id=${escapeHtml(id || "-")}</div>`;
+
+    const right = document.createElement("div");
+    right.appendChild(badge);
+
+    top.appendChild(left);
+    top.appendChild(right);
+
+    const snip = document.createElement("div");
+    snip.className = "snip";
+    snip.textContent = (it.snippet || it.summary || "").toString();
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    const mkBtn = (label, cls, fn) => {
+      const b = document.createElement("button");
+      b.className = `btn ${cls || ""}`.trim();
+      b.textContent = label;
+      b.addEventListener("click", fn);
+      return b;
     };
 
-    const r = await fetch(url, { ...opts, method, headers, cache: "no-store" });
+    actions.appendChild(mkBtn("Draft", "ghost", async () => {
+      await setItemStatus(it, "draft");
+    }));
+    actions.appendChild(mkBtn("Approve", "ghost", async () => {
+      await setItemStatus(it, "approved");
+    }));
+    actions.appendChild(mkBtn("Sent", "ghost", async () => {
+      await setItemStatus(it, "sent");
+    }));
 
-    if (r.status === 401) {
-      toast401Once();
-    }
-
-    return r;
+    card.appendChild(top);
+    card.appendChild(snip);
+    card.appendChild(actions);
+    root.appendChild(card);
   }
+}
 
-  async function apiJson(url, opts = {}) {
-    const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
-    const r = await apiFetch(url, { ...opts, headers });
-
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      throw new Error(`${r.status} ${r.statusText} :: ${t}`.trim());
-    }
-    return r.json();
+async function setItemStatus(it, status) {
+  const date = getDateValue();
+  const platform = (it.platform || getPlatformValue() || "telegram").toString();
+  const itemId = (it.id || "").toString();
+  if (!itemId) {
+    setStatusLine("This item has no id yet. Import/ensure ids first.");
+    return;
   }
+  setStatusLine(`Setting status… ${platform}:${itemId} -> ${status}`);
+  await apiFetch(`/api/newsroom/status?date=${encodeURIComponent(date)}&platform=${encodeURIComponent(platform)}&item_id=${encodeURIComponent(itemId)}&status=${encodeURIComponent(status)}`, {
+    method: "POST"
+  });
+  await loadPlan();
+}
 
-  async function downloadBlob(url, filenameFallback) {
-    const r = await apiFetch(url, { method: "GET" });
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      throw new Error(`${r.status} ${r.statusText} :: ${t}`.trim());
-    }
+async function loadPlan() {
+  const date = getDateValue();
+  const platform = getPlatformValue();
+  setStatusLine(`Loading plan… date=${date} platform=${platform}`);
 
-    const blob = await r.blob();
+  const data = await apiFetch(`/api/newsroom/plan?date=${encodeURIComponent(date)}&platform=${encodeURIComponent(platform)}`);
+  const items = Array.isArray(data.items) ? data.items : [];
 
-    let fn = filenameFallback || "download.txt";
-    const cd = r.headers.get("content-disposition") || "";
-    const m = cd.match(/filename="([^"]+)"/i);
-    if (m && m[1]) fn = m[1];
+  setStatusLine(`date=${data.date} • platform=${data.platform} • items=${items.length}`);
+  renderItems(items);
+}
 
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = fn;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
+async function approveAll() {
+  const date = getDateValue();
+  const platform = getPlatformValue();
+  if (platform === "all") {
+    setStatusLine("Approve All requires a specific platform (telegram/instagram).");
+    return;
   }
+  setStatusLine(`Approving all drafts… date=${date} platform=${platform}`);
+  const data = await apiFetch(`/api/newsroom/approve_all?date=${encodeURIComponent(date)}&platform=${encodeURIComponent(platform)}`, { method: "POST" });
+  setStatusLine(`Approved ${data.approved} items • ${data.platform}`);
+  await loadPlan();
+}
 
-  function setBusy(on, btn) {
-    state.busy = on;
-    const buttons = document.querySelectorAll("button");
-    buttons.forEach((b) => (b.disabled = on));
+async function runPublish(dryRun) {
+  const date = getDateValue();
+  const platform = getPlatformValue();
+  setStatusLine(`${dryRun ? "Dry-run" : "Publish"}… date=${date} platform=${platform}`);
 
-    // keep Close enabled
-    els.modalClose.disabled = false;
+  const url = `/api/newsroom/run?date=${encodeURIComponent(date)}&platform=${encodeURIComponent(platform)}&dry_run=${dryRun ? "true" : "false"}&confirm=${dryRun ? "false" : "true"}`;
+  const data = await apiFetch(url, { method: "POST" });
 
-    if (btn) btn.disabled = on;
+  setStatusLine(`Run OK • candidates=${data.candidates} • sent=${data.sent} • platform=${data.platform}`);
+  await loadPlan();
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function bind() {
+  const dateEl = $("#dateInput");
+  if (dateEl && !dateEl.value) dateEl.value = todayISO();
+
+  const tokenInput = $("#tokenInput");
+  const saveBtn = $("#saveTokenBtn");
+  const clearBtn = $("#clearTokenBtn");
+
+  if (tokenInput) tokenInput.value = getSavedToken();
+
+  if (saveBtn) {
+    saveBtn.addEventListener("click", async () => {
+      saveToken(tokenInput ? tokenInput.value : "");
+      await refreshAuthBanner();
+      setStatusLine("Token saved.");
+      await loadPlan();
+    });
   }
-
-  async function guarded(btn, fn) {
-    if (state.busy) return;
-    try {
-      setBusy(true, btn);
-      await fn();
-    } catch (e) {
-      toast(String(e.message || e), 5200);
-      console.error(e);
-    } finally {
-      setBusy(false, btn);
-    }
-  }
-
-  // ---------------- Rendering ----------------
-  function setTabs(active) {
-    state.filter = active;
-    [els.tabAll, els.tabDraft, els.tabApproved, els.tabSent].forEach((t) => t.classList.remove("tabOn"));
-    const map = { all: els.tabAll, draft: els.tabDraft, approved: els.tabApproved, sent: els.tabSent };
-    (map[active] || els.tabAll).classList.add("tabOn");
-    render();
-  }
-
-  function setStatusLine() {
-    const d = state.plan.date || "(date?)";
-    const p = state.plan.platform || "(platform?)";
-    const c = state.plan.counts || { draft: 0, approved: 0, sent: 0 };
-    els.statusLine.textContent = `date=${d} • platform=${p} • counts: draft=${c.draft} approved=${c.approved} sent=${c.sent} • showing=${filteredItems().length}`;
-  }
-
-  function filteredItems() {
-    const q = (state.query || "").toLowerCase().trim();
-    return (state.plan.items || []).filter((it) => {
-      const st = (it.status || "draft").toLowerCase();
-      if (state.filter !== "all" && st !== state.filter) return false;
-      if (!q) return true;
-
-      const text = [
-        it.id, it.topic_id, it.title, it.snippet, it.hashtags, it.platform, it.status
-      ].join(" ").toLowerCase();
-
-      return text.includes(q);
+  if (clearBtn) {
+    clearBtn.addEventListener("click", async () => {
+      saveToken("");
+      if (tokenInput) tokenInput.value = "";
+      await refreshAuthBanner();
+      setStatusLine("Token cleared.");
+      await loadPlan();
     });
   }
 
-  function pillStatusClass(st) {
-    st = (st || "draft").toLowerCase();
-    if (st === "approved") return "pillStatusApproved";
-    if (st === "sent") return "pillStatusSent";
-    return "pillStatusDraft";
-  }
+  $("#loadPlanBtn")?.addEventListener("click", () => loadPlan().catch(e => setStatusLine(`Load failed: ${e.message}`)));
+  $("#approveAllBtn")?.addEventListener("click", () => approveAll().catch(e => setStatusLine(`Approve failed: ${e.message}`)));
+  $("#dryRunBtn")?.addEventListener("click", () => runPublish(true).catch(e => setStatusLine(`Run failed: ${e.message}`)));
+  $("#publishBtn")?.addEventListener("click", () => runPublish(false).catch(e => setStatusLine(`Run failed: ${e.message}`)));
 
-  async function cycleStatus(item) {
-    const order = ["draft", "approved", "sent"];
-    const cur = (item.status || "draft").toLowerCase();
-    const next = order[(order.indexOf(cur) + 1) % order.length];
+  refreshAuthBanner().finally(() => loadPlan().catch(e => setStatusLine(`Load failed: ${e.message}`)));
+}
 
-    await apiJson(`/api/newsroom/status?date=${encodeURIComponent(state.plan.date)}&platform=${encodeURIComponent(state.plan.platform)}`, {
-      method: "POST",
-      body: JSON.stringify({ id: item.id, status: next }),
-    });
-
-    await loadPlan();
-  }
-
-  async function undoStatus(item) {
-    await apiJson(`/api/newsroom/undo?date=${encodeURIComponent(state.plan.date)}&platform=${encodeURIComponent(state.plan.platform)}`, {
-      method: "POST",
-      body: JSON.stringify({ id: item.id }),
-    });
-    await loadPlan();
-  }
-
-  function render() {
-    setStatusLine();
-    const items = filteredItems();
-
-    els.cards.innerHTML = "";
-    for (const it of items) {
-      const st = (it.status || "draft").toLowerCase();
-
-      const card = document.createElement("div");
-      card.className = "card";
-
-      const top = document.createElement("div");
-      top.className = "cardTop";
-      top.innerHTML = `
-        <span class="pill ${pillStatusClass(st)}">${st.toUpperCase()}</span>
-        <span class="pill">${it.platform || ""}</span>
-        <span class="pill">${it.id || ""}</span>
-      `;
-
-      const title = document.createElement("div");
-      title.className = "cardTitle";
-      title.textContent = it.title && it.title.trim() ? it.title.trim() : "(no title)";
-
-      const body = document.createElement("div");
-      body.className = "cardBody";
-      body.textContent = `${(it.snippet || "").trim()}\n\n${(it.hashtags || "").trim()}`.trim();
-
-      const meta = document.createElement("div");
-      meta.className = "cardMeta";
-      meta.innerHTML = `<span>topic: ${it.topic_id || it.id || ""}</span><span>${it.sent_at ? "sent_at: " + it.sent_at : ""}</span>`;
-
-      const actions = document.createElement("div");
-      actions.className = "cardActions";
-
-      const cycleBtn = document.createElement("button");
-      cycleBtn.className = "btn btnGhost";
-      cycleBtn.textContent = "Cycle";
-      cycleBtn.onclick = () => guarded(cycleBtn, () => cycleStatus(it));
-
-      const undoBtn = document.createElement("button");
-      undoBtn.className = "btn btnGhost";
-      undoBtn.textContent = "Undo";
-      undoBtn.onclick = () => guarded(undoBtn, () => undoStatus(it));
-
-      actions.appendChild(cycleBtn);
-      actions.appendChild(undoBtn);
-
-      card.appendChild(top);
-      card.appendChild(title);
-      card.appendChild(body);
-      card.appendChild(meta);
-      card.appendChild(actions);
-
-      els.cards.appendChild(card);
-    }
-  }
-
-  // ---------------- Actions ----------------
-  async function loadPlan() {
-    const d = (els.date.value || "").trim();
-    const p = (els.platform.value || "telegram").trim();
-
-    const j = await apiJson(`/api/newsroom/plan?date=${encodeURIComponent(d)}&platform=${encodeURIComponent(p)}`, { method: "GET" });
-    state.plan.date = j.date;
-    state.plan.platform = j.platform;
-    state.plan.counts = j.counts || { draft: 0, approved: 0, sent: 0 };
-    state.plan.items = j.items || [];
-    render();
-  }
-
-  async function loadLatest() {
-    const p = (els.platform.value || "telegram").trim();
-    const j = await apiJson(`/api/newsroom/latest?platform=${encodeURIComponent(p)}`, { method: "GET" });
-    els.date.value = j.date;
-    await loadPlan();
-  }
-
-  async function approveAll() {
-    const d = state.plan.date || els.date.value;
-    const p = state.plan.platform || els.platform.value;
-    await apiJson(`/api/newsroom/approve_all?date=${encodeURIComponent(d)}&platform=${encodeURIComponent(p)}`, { method: "POST" });
-    await loadPlan();
-  }
-
-  async function dryRun() {
-    const payload = { date: state.plan.date || els.date.value, platform: state.plan.platform || els.platform.value, dry_run: true, confirm: false };
-    const j = await apiJson(`/api/newsroom/run`, { method: "POST", body: JSON.stringify(payload) });
-    openModal("Dry-Run Preview", JSON.stringify(j, null, 2));
-    await loadPlan();
-  }
-
-  async function publishConfirm() {
-    if (!confirm("Publish (mark approved items as sent)?")) return;
-    const payload = { date: state.plan.date || els.date.value, platform: state.plan.platform || els.platform.value, dry_run: false, confirm: true };
-    const j = await apiJson(`/api/newsroom/run`, { method: "POST", body: JSON.stringify(payload) });
-    openModal("Publish Result", JSON.stringify(j, null, 2));
-    await loadPlan();
-  }
-
-  async function importCsvFlow() {
-    els.csvFile.click();
-  }
-
-  async function doImport(file) {
-    const d = state.plan.date || els.date.value;
-    const p = state.plan.platform || els.platform.value;
-
-    const fd = new FormData();
-    fd.append("file", file);
-
-    const r = await apiFetch(`/api/newsroom/import_csv?date=${encodeURIComponent(d)}&platform=${encodeURIComponent(p)}`, {
-      method: "POST",
-      body: fd,
-      headers: {}, // DO NOT set content-type for FormData
-    });
-
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      throw new Error(`${r.status} ${r.statusText} :: ${t}`.trim());
-    }
-
-    const j = await r.json();
-    toast(`CSV imported: added=${j.added} updated=${j.updated}`);
-    await loadPlan();
-  }
-
-  async function downloadPlanJson() {
-    const d = state.plan.date || els.date.value;
-    const p = state.plan.platform || els.platform.value;
-    const url = `/api/newsroom/plan?date=${encodeURIComponent(d)}&platform=${encodeURIComponent(p)}`;
-    await downloadBlob(url, `newsroom_plan_${d}_${p}.json`);
-  }
-
-  async function downloadIgCaptions() {
-    const d = state.plan.date || els.date.value;
-    await downloadBlob(`/api/newsroom/ig_captions?date=${encodeURIComponent(d)}`, `instagram_captions_${d}.txt`);
-  }
-
-  async function showLogs() {
-    const d = state.plan.date || els.date.value;
-    const r = await apiFetch(`/api/newsroom/logs?date=${encodeURIComponent(d)}`, { method: "GET" });
-    const t = await r.text();
-    openModal("logs.jsonl", t || "(empty)");
-  }
-
-  async function showMetrics() {
-    const d = state.plan.date || els.date.value;
-    const p = state.plan.platform || els.platform.value;
-    const j = await apiJson(`/api/newsroom/metrics?date=${encodeURIComponent(d)}&platform=${encodeURIComponent(p)}`, { method: "GET" });
-    openModal("Metrics", JSON.stringify(j, null, 2));
-  }
-
-  async function copyCurl() {
-    if (!state.lastReq) {
-      toast("No request recorded yet.");
-      return;
-    }
-    const { method, url, headers, body } = state.lastReq;
-
-    const hdrs = Object.entries(headers || {})
-      .map(([k, v]) => `-H "${k}: ${String(v).replace(/"/g, '\\"')}"`)
-      .join(" ");
-
-    let cmd = `curl -sS -X ${method} ${hdrs} "http://127.0.0.1:9000${url}"`;
-    if (body) {
-      const b = typeof body === "string" ? body : "";
-      if (b) cmd += ` -d '${b.replace(/'/g, "'\\''")}'`;
-    }
-
-    await navigator.clipboard.writeText(cmd);
-    toast("curl copied to clipboard.");
-  }
-
-  // ---------------- Wire up ----------------
-  function todayISO() {
-    const d = new Date();
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${d.getFullYear()}-${mm}-${dd}`;
-  }
-
-  async function init() {
-    // set defaults
-    els.date.value = todayISO();
-    loadTokenFromLocalStorage();
-
-    // modal
-    els.modalClose.onclick = closeModal;
-    els.modal.onclick = (e) => { if (e.target === els.modal) closeModal(); };
-
-    // tabs
-    els.tabAll.onclick = () => setTabs("all");
-    els.tabDraft.onclick = () => setTabs("draft");
-    els.tabApproved.onclick = () => setTabs("approved");
-    els.tabSent.onclick = () => setTabs("sent");
-
-    // token buttons
-    els.saveToken.onclick = () => saveTokenToLocalStorage();
-    els.clearToken.onclick = () => clearToken();
-
-    // actions
-    els.loadPlan.onclick = () => guarded(els.loadPlan, loadPlan);
-    els.latest.onclick = () => guarded(els.latest, loadLatest);
-    els.approveAll.onclick = () => guarded(els.approveAll, approveAll);
-    els.dryRun.onclick = () => guarded(els.dryRun, dryRun);
-    els.publish.onclick = () => guarded(els.publish, publishConfirm);
-    els.importBtn.onclick = () => guarded(els.importBtn, importCsvFlow);
-    els.browse.onclick = () => guarded(els.browse, downloadPlanJson);
-    els.igCaptions.onclick = () => guarded(els.igCaptions, downloadIgCaptions);
-    els.logs.onclick = () => guarded(els.logs, showLogs);
-    els.metrics.onclick = () => guarded(els.metrics, showMetrics);
-    els.copyCurl.onclick = () => guarded(els.copyCurl, copyCurl);
-
-    els.search.onclick = () => { state.query = (els.q.value || "").trim(); render(); };
-    els.q.addEventListener("keydown", (e) => { if (e.key === "Enter") { state.query = (els.q.value || "").trim(); render(); } });
-
-    els.csvFile.addEventListener("change", () => {
-      const f = els.csvFile.files && els.csvFile.files[0];
-      els.csvFile.value = "";
-      if (!f) return;
-      guarded(els.importBtn, () => doImport(f));
-    });
-
-    // ✅ Step 10 start: probe auth & set badge
-    await probeAuthEnabled();
-
-    // initial plan
-    await guarded(els.loadPlan, loadPlan);
-  }
-
-  document.addEventListener("DOMContentLoaded", init);
-})();
+window.addEventListener("DOMContentLoaded", bind);

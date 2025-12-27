@@ -1,118 +1,88 @@
-﻿# satyagrah/web/jobs_api.py
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
-from datetime import datetime, date
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, APIRouter, Request, UploadFile, File, HTTPException, Query, Body
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    File,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
-# ---------------------------------------------------------------------
-# Paths (this file is: \satyagrah\web\jobs_api.py)
-# ---------------------------------------------------------------------
-THIS_FILE = Path(__file__).resolve()
-ROOT_DIR = THIS_FILE.parents[2]
+
+# ---------------------------
+# Paths (NEVER depend on CWD)
+# ---------------------------
+
+HERE = Path(__file__).resolve()
+# satyagrah/web/jobs_api.py -> project root is 3 levels up: D:\AISatyagrah
+ROOT_DIR = HERE.parents[2]
+DATA_DIR = ROOT_DIR / "data"
+RUNS_DIR = DATA_DIR / "runs"
 UI_DIR = ROOT_DIR / "ui"
-RUNS_DIR = ROOT_DIR / "data" / "runs"
-PLAN_NAME = "newsroom_plan.jsonl"
+AUTH_FILE_DEFAULT = ROOT_DIR / ".auth_token"
 
-# ---------------------------------------------------------------------
-# Auth: if AUTH_TOKEN env var set, require x-auth header (or Bearer)
-# ---------------------------------------------------------------------
-def _required_token() -> str:
-    return (os.getenv("AUTH_TOKEN") or "").strip()
 
-def _auth_enabled() -> bool:
-    return bool(_required_token())
+# ---------------------------
+# Small JSONL utilities
+# ---------------------------
 
-def _get_request_token(req: Request) -> str:
-    # Prefer x-auth header, fallback to Authorization: Bearer
-    tok = (req.headers.get("x-auth") or "").strip()
-    if tok:
-        return tok
-    auth = (req.headers.get("authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
-    return ""
-
-def require_auth(req: Request) -> None:
-    need = _required_token()
-    if not need:
-        return
-    got = _get_request_token(req)
-    if not got or got != need:
-        raise HTTPException(status_code=401, detail="Invalid or missing x-auth token")
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
 def ensure_dirs() -> None:
-    UI_DIR.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def norm_date(d: Optional[str]) -> str:
-    if d and str(d).strip():
-        return str(d).strip()
-    return date.today().isoformat()
+    if not d:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+    return d.strip()
 
-def run_dir(d: str) -> Path:
-    return RUNS_DIR / d
 
-def plan_path(d: str) -> Path:
-    return run_dir(d) / PLAN_NAME
+def plan_path(date: str) -> Path:
+    return RUNS_DIR / date / "newsroom_plan.jsonl"
+
 
 def read_jsonl(p: Path) -> List[Dict[str, Any]]:
     if not p.exists():
         return []
     items: List[Dict[str, Any]] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            items.append(json.loads(line))
-        except Exception:
-            continue
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except Exception:
+                # ignore bad lines, don't crash UI
+                continue
     return items
 
-def write_jsonl(p: Path, items: List[Dict[str, Any]]) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    txt = "\n".join(json.dumps(it, ensure_ascii=False) for it in items) + ("\n" if items else "")
-    p.write_text(txt, encoding="utf-8")
 
-def latest_plan_date(platform: str = "telegram") -> Optional[str]:
-    if not RUNS_DIR.exists():
-        return None
-    dates: List[str] = []
-    for child in RUNS_DIR.iterdir():
-        if not child.is_dir():
-            continue
-        pp = child / PLAN_NAME
-        if not pp.exists():
-            continue
-        try:
-            items = read_jsonl(pp)
-            if platform:
-                if any((it.get("platform") or "") == platform for it in items):
-                    dates.append(child.name)
-            else:
-                dates.append(child.name)
-        except Exception:
-            continue
-    dates.sort()
-    return dates[-1] if dates else None
+def write_jsonl(p: Path, rows: List[Dict[str, Any]]) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8", newline="\n") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
 
 def ensure_ids(items: List[Dict[str, Any]], platform: str) -> List[Dict[str, Any]]:
+    # stable-ish ids: t1..tN per platform if missing
     used = set()
     for it in items:
         if it.get("platform") == platform and it.get("id"):
             used.add(str(it["id"]))
-
     n = 1
     for it in items:
         if it.get("platform") != platform:
@@ -121,188 +91,245 @@ def ensure_ids(items: List[Dict[str, Any]], platform: str) -> List[Dict[str, Any
             while f"t{n}" in used:
                 n += 1
             it["id"] = f"t{n}"
-            it["topic_id"] = it.get("topic_id") or it["id"]
             used.add(it["id"])
             n += 1
-        if not it.get("topic_id"):
-            it["topic_id"] = it["id"]
     return items
 
-def counts_for(items: List[Dict[str, Any]], platform: str) -> Dict[str, int]:
-    c = {"draft": 0, "approved": 0, "sent": 0}
-    for it in items:
-        if platform and it.get("platform") != platform:
-            continue
-        st = (it.get("status") or "draft").lower()
-        if st not in c:
-            st = "draft"
-        c[st] += 1
-    return c
 
 def filter_items(items: List[Dict[str, Any]], platform: str) -> List[Dict[str, Any]]:
-    if not platform:
+    plat = (platform or "").strip().lower()
+    if plat in ("", "all", "*"):
         return items
-    return [it for it in items if (it.get("platform") or "") == platform]
+    return [x for x in items if (x.get("platform") or "").strip().lower() == plat]
 
-# ---------------------------------------------------------------------
-# API
-# ---------------------------------------------------------------------
+
+# ---------------------------
+# Auth (robust, reloadable)
+# ---------------------------
+
+def _sha256_12(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+
+def _read_text_no_bom(p: Path) -> str:
+    # read as UTF-8, strip BOM and whitespace/newlines
+    raw = p.read_text(encoding="utf-8", errors="strict")
+    raw = raw.replace("\ufeff", "")
+    return raw.strip()
+
+
+@dataclass
+class AuthState:
+    enabled: bool
+    header: str
+    token: Optional[str]
+    token_source: str  # "env" | "file" | "none"
+    auth_file: str
+    token_len: int
+    token_sha256_12: str
+
+
+class AuthManager:
+    """
+    Deterministic precedence:
+      1) If AUTH_TOKEN is set (non-empty) -> use env
+      2) Else if auth file exists and non-empty -> use file
+      3) Else auth disabled
+    Reload rules:
+      - If file-based, re-read when file mtime changes
+      - If env-based, re-check env every request (cheap)
+    """
+
+    def __init__(self, auth_file: Path, header: str = "x-auth"):
+        self.auth_file = auth_file
+        self.header = header
+        self._cached_file_token: Optional[str] = None
+        self._cached_file_mtime: Optional[float] = None
+
+    def _get_env_token(self) -> Optional[str]:
+        t = os.environ.get("AUTH_TOKEN")
+        if t is None:
+            return None
+        t = t.strip()
+        return t if t else None
+
+    def _get_file_token(self) -> Optional[str]:
+        if not self.auth_file.exists():
+            self._cached_file_token = None
+            self._cached_file_mtime = None
+            return None
+
+        try:
+            mtime = self.auth_file.stat().st_mtime
+        except Exception:
+            return None
+
+        if self._cached_file_mtime is not None and mtime == self._cached_file_mtime:
+            return self._cached_file_token
+
+        try:
+            tok = _read_text_no_bom(self.auth_file)
+        except Exception:
+            tok = ""
+
+        tok = tok.strip()
+        self._cached_file_mtime = mtime
+        self._cached_file_token = tok if tok else None
+        return self._cached_file_token
+
+    def state(self) -> AuthState:
+        env_tok = self._get_env_token()
+        if env_tok:
+            return AuthState(
+                enabled=True,
+                header=self.header,
+                token=env_tok,
+                token_source="env",
+                auth_file=str(self.auth_file),
+                token_len=len(env_tok),
+                token_sha256_12=_sha256_12(env_tok),
+            )
+
+        file_tok = self._get_file_token()
+        if file_tok:
+            return AuthState(
+                enabled=True,
+                header=self.header,
+                token=file_tok,
+                token_source="file",
+                auth_file=str(self.auth_file),
+                token_len=len(file_tok),
+                token_sha256_12=_sha256_12(file_tok),
+            )
+
+        return AuthState(
+            enabled=False,
+            header=self.header,
+            token=None,
+            token_source="none",
+            auth_file=str(self.auth_file),
+            token_len=0,
+            token_sha256_12="",
+        )
+
+    def check(self, request: Request) -> Tuple[bool, AuthState]:
+        st = self.state()
+        if not st.enabled:
+            return True, st
+
+        got = (request.headers.get(self.header) or "").strip()
+        ok = bool(got) and (st.token is not None) and (got == st.token)
+        return ok, st
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Returning JSONResponse avoids middleware exception-group weirdness.
+    """
+
+    def __init__(self, app, auth: AuthManager):
+        super().__init__(app)
+        self.auth = auth
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # always allow UI + version + auth status endpoints
+        if (
+            path.startswith("/ui")
+            or path.startswith("/favicon")
+            or path.startswith("/api/version")
+            or path.startswith("/api/auth/enabled")
+        ):
+            return await call_next(request)
+
+        ok, st = self.auth.check(request)
+        if not ok:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": f"Invalid or missing {st.header} token",
+                    "header": st.header,
+                    "token_source": st.token_source,
+                },
+            )
+
+        return await call_next(request)
+
+
+# ---------------------------
+# FastAPI app + routes
+# ---------------------------
+
 router = APIRouter()
 
-@router.get("/api/health")
-def api_health():
-    return {"ok": True}
 
 @router.get("/api/version")
 def api_version():
-    return {"app": "AISatyagrah Jobs API", "newsroom": True}
+    return {
+        "ok": True,
+        "app": "AISatyagrah Jobs API",
+        "root": str(ROOT_DIR / "satyagrah" / "web"),
+    }
 
-# ✅ Phase 1 (Step 9): auth probe endpoint (no auth required)
+
 @router.get("/api/auth/enabled")
-def api_auth_enabled():
-    return {"enabled": _auth_enabled(), "header": "x-auth"}
+def api_auth_enabled(request: Request):
+    auth: AuthManager = request.app.state.auth
+    st = auth.state()
+    # never return token itself
+    return {
+        "enabled": st.enabled,
+        "header": st.header,
+        "token_len": st.token_len,
+        "token_sha256_12": st.token_sha256_12,
+        "token_source": st.token_source,
+        "auth_file": st.auth_file,
+    }
 
-@router.get("/favicon.ico")
-def favicon():
-    return PlainTextResponse("", status_code=204)
-
-@router.get("/ui/newsroom", response_class=HTMLResponse)
-def ui_newsroom():
-    p = UI_DIR / "newsroom.html"
-    if not p.exists():
-        raise HTTPException(404, "newsroom.html not found")
-    # No-cache so you always see latest UI while developing
-    return FileResponse(
-        str(p),
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-        },
-    )
-
-@router.get("/api/newsroom/latest")
-def newsroom_latest(request: Request, platform: str = Query("telegram")):
-    require_auth(request)
-    d = latest_plan_date(platform=platform) or norm_date(None)
-    return {"date": d, "platform": platform}
 
 @router.get("/api/newsroom/plan")
-def newsroom_plan(
-    request: Request,
-    date: Optional[str] = Query(None),
-    platform: str = Query("telegram"),
-):
-    require_auth(request)
+def newsroom_plan(date: Optional[str] = Query(None), platform: str = Query("all")):
     ensure_dirs()
     d = norm_date(date)
     p = plan_path(d)
     items = read_jsonl(p)
-    items = ensure_ids(items, platform)
-    write_jsonl(p, items)
-    out = filter_items(items, platform)
-    return {
-        "date": d,
-        "platform": platform,
-        "counts": counts_for(items, platform),
-        "items": out,
-    }
+    plat = platform.strip() or "all"
+    return {"date": d, "platform": plat, "items": filter_items(items, plat)}
 
-@router.get("/api/newsroom/metrics")
-def newsroom_metrics(
-    request: Request,
-    date: Optional[str] = Query(None),
-    platform: str = Query("telegram"),
-):
-    require_auth(request)
-    ensure_dirs()
-    d = norm_date(date)
-    p = plan_path(d)
-    items = read_jsonl(p)
-    items = ensure_ids(items, platform)
-    write_jsonl(p, items)
-    return {
-        "date": d,
-        "platform": platform,
-        "auth_enabled": _auth_enabled(),
-        "counts": counts_for(items, platform),
-        "total_platform_items": len(filter_items(items, platform)),
-        "plan_file": str(p),
-    }
-
-@router.get("/api/newsroom/logs")
-def newsroom_logs(request: Request, date: Optional[str] = Query(None)):
-    require_auth(request)
-    ensure_dirs()
-    d = norm_date(date)
-    p = run_dir(d) / "logs.jsonl"
-    if not p.exists():
-        return PlainTextResponse("(no logs.jsonl for this date)\n", status_code=200)
-    return PlainTextResponse(p.read_text(encoding="utf-8", errors="replace") + "\n")
 
 @router.post("/api/newsroom/status")
-def newsroom_status(
-    request: Request,
+async def newsroom_status(
     date: str = Query(...),
-    platform: str = Query("telegram"),
-    payload: Dict[str, Any] = Body(...),
+    platform: str = Query(...),
+    item_id: str = Query(...),
+    status: str = Query(...),
 ):
-    require_auth(request)
     ensure_dirs()
     d = norm_date(date)
-    item_id = str(payload.get("id") or "").strip()
-    new_status = str(payload.get("status") or "").strip().lower()
-    if not item_id:
-        raise HTTPException(400, "Missing id")
-    if new_status not in ("draft", "approved", "sent"):
-        raise HTTPException(400, "Invalid status")
-
     p = plan_path(d)
     items = read_jsonl(p)
 
-    changed = 0
+    status = (status or "").strip().lower()
+    if status not in ("draft", "approved", "sent"):
+        status = "draft"
+
+    updated = False
     for it in items:
         if (it.get("platform") or "") == platform and str(it.get("id") or "") == item_id:
-            prev = (it.get("status") or "draft").lower()
-            it["prev_status"] = prev
-            it["status"] = new_status
-            changed = 1
+            it["status"] = status
+            it["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            updated = True
             break
 
-    write_jsonl(p, ensure_ids(items, platform))
-    return {"date": d, "platform": platform, "id": item_id, "changed": changed, "status": new_status}
+    # keep ids stable for that platform
+    items = ensure_ids(items, platform)
+    write_jsonl(p, items)
+    return {"date": d, "platform": platform, "updated": updated}
 
-@router.post("/api/newsroom/undo")
-def newsroom_undo(
-    request: Request,
-    date: str = Query(...),
-    platform: str = Query("telegram"),
-    payload: Dict[str, Any] = Body(...),
-):
-    require_auth(request)
-    d = norm_date(date)
-    item_id = str(payload.get("id") or "").strip()
-    if not item_id:
-        raise HTTPException(400, "Missing id")
-
-    p = plan_path(d)
-    items = read_jsonl(p)
-
-    changed = 0
-    for it in items:
-        if (it.get("platform") or "") == platform and str(it.get("id") or "") == item_id:
-            prev = (it.get("prev_status") or "draft").lower()
-            if prev not in ("draft", "approved", "sent"):
-                prev = "draft"
-            it["status"] = prev
-            changed = 1
-            break
-
-    write_jsonl(p, ensure_ids(items, platform))
-    return {"date": d, "platform": platform, "id": item_id, "changed": changed}
 
 @router.post("/api/newsroom/approve_all")
-def newsroom_approve_all(request: Request, date: str = Query(...), platform: str = Query("telegram")):
-    require_auth(request)
+def newsroom_approve_all(date: str = Query(...), platform: str = Query("telegram")):
     ensure_dirs()
     d = norm_date(date)
     p = plan_path(d)
@@ -314,35 +341,43 @@ def newsroom_approve_all(request: Request, date: str = Query(...), platform: str
             continue
         st = (it.get("status") or "draft").lower()
         if st == "draft":
-            it["prev_status"] = st
             it["status"] = "approved"
             changed += 1
 
-    write_jsonl(p, ensure_ids(items, platform))
+    items = ensure_ids(items, platform)
+    write_jsonl(p, items)
     return {"date": d, "platform": platform, "approved": changed}
 
-@router.post("/api/newsroom/run")
-def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
-    require_auth(request)
-    ensure_dirs()
-    d = norm_date(payload.get("date"))
-    platform = str(payload.get("platform") or "telegram").strip()
-    dry_run = bool(payload.get("dry_run", True))
-    confirm = bool(payload.get("confirm", False))
 
+@router.post("/api/newsroom/run")
+def newsroom_run(
+    date: str = Query(...),
+    platform: str = Query("telegram"),
+    dry_run: bool = Query(True),
+    confirm: bool = Query(False),
+):
+    """
+    Simulated publisher for now:
+      - dry_run: returns preview only
+      - confirm=true: marks approved items as sent
+    """
+    ensure_dirs()
+    d = norm_date(date)
     p = plan_path(d)
     items = read_jsonl(p)
-    items = ensure_ids(items, platform)
 
-    candidates = [
-        it
-        for it in items
-        if (it.get("platform") or "") == platform and (it.get("status") or "draft").lower() == "approved"
-    ]
+    plat = (platform or "telegram").strip().lower()
+    if plat in ("all", "*", ""):
+        candidates = [it for it in items if (it.get("status") or "draft").lower() == "approved"]
+    else:
+        candidates = [
+            it for it in items
+            if (it.get("platform") or "").strip().lower() == plat
+            and (it.get("status") or "draft").lower() == "approved"
+        ]
 
+    preview: List[str] = []
     sent = 0
-    messages: List[str] = []
-
     for it in candidates:
         msg = ""
         if it.get("title"):
@@ -352,7 +387,7 @@ def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
         if h:
             msg += "\n" + h
         msg = msg.strip()
-        messages.append(msg)
+        preview.append(msg)
 
         if (not dry_run) and confirm:
             it["prev_status"] = (it.get("status") or "approved").lower()
@@ -360,7 +395,12 @@ def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
             it["sent_at"] = datetime.utcnow().isoformat() + "Z"
             sent += 1
 
-    write_jsonl(p, ensure_ids(items, platform))
+    # keep ids stable per platform for all platforms present
+    platforms = sorted({(it.get("platform") or "").strip() for it in items if (it.get("platform") or "").strip()})
+    for pplat in platforms:
+        items = ensure_ids(items, pplat)
+
+    write_jsonl(p, items)
     return {
         "date": d,
         "platform": platform,
@@ -368,17 +408,16 @@ def newsroom_run(request: Request, payload: Dict[str, Any] = Body(...)):
         "confirm": confirm,
         "candidates": len(candidates),
         "sent": sent,
-        "preview": messages[:50],
+        "preview": preview[:50],
     }
+
 
 @router.post("/api/newsroom/import_csv")
 async def newsroom_import_csv(
-    request: Request,
     date: str = Query(...),
     platform: str = Query("telegram"),
     file: UploadFile = File(...),
 ):
-    require_auth(request)
     ensure_dirs()
     d = norm_date(date)
 
@@ -395,7 +434,6 @@ async def newsroom_import_csv(
         status = (row.get("status") or "draft").strip().lower()
         if status not in ("draft", "approved", "sent"):
             status = "draft"
-
         incoming.append(
             {
                 "date": d,
@@ -432,12 +470,17 @@ async def newsroom_import_csv(
 
     items = ensure_ids(items, platform)
     write_jsonl(p, items)
+    return {
+        "date": d,
+        "platform": platform,
+        "added": added,
+        "updated": updated,
+        "total": len(filter_items(items, platform)),
+    }
 
-    return {"date": d, "platform": platform, "added": added, "updated": updated, "total": len(filter_items(items, platform))}
 
 @router.get("/api/newsroom/ig_captions")
-def newsroom_ig_captions(request: Request, date: Optional[str] = Query(None)):
-    require_auth(request)
+def newsroom_ig_captions(date: Optional[str] = Query(None)):
     ensure_dirs()
     d = norm_date(date)
     p = plan_path(d)
@@ -467,18 +510,32 @@ def newsroom_ig_captions(request: Request, date: Optional[str] = Query(None)):
 
     txt = "\n\n---\n\n".join(lines) + "\n"
     fn = f"instagram_captions_{d}.txt"
-    headers = {"Content-Disposition": f'attachment; filename="{fn}"'}
-    return PlainTextResponse(txt, headers=headers)
+    return PlainTextResponse(txt, headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+
 
 def create_app() -> FastAPI:
     ensure_dirs()
     app = FastAPI(title="AISatyagrah Jobs API")
 
-    # Static UI assets: /ui-static/newsroom.css, /ui-static/newsroom.js
-    app.mount("/ui-static", StaticFiles(directory=str(UI_DIR)), name="ui-static")
+    app.state.auth = AuthManager(auth_file=AUTH_FILE_DEFAULT, header="x-auth")
+    app.add_middleware(AuthMiddleware, auth=app.state.auth)
 
+    # --- UI route FIRST (so /ui/newsroom always works)
+    @app.get("/ui/newsroom", include_in_schema=False, response_class=HTMLResponse)
+    def _ui_newsroom():
+        html_path = UI_DIR / "newsroom.html"
+        if html_path.exists():
+            return HTMLResponse(html_path.read_text(encoding="utf-8", errors="replace"))
+        return HTMLResponse(f"<html><body><h2>Missing {html_path}</h2></body></html>")
+
+    # static UI files (css/js/html)
+    if UI_DIR.exists():
+        app.mount("/ui", StaticFiles(directory=str(UI_DIR)), name="ui")
+
+    # API router
     app.include_router(router)
+
     return app
 
-# uvicorn satyagrah.web.jobs_api:app
+
 app = create_app()
